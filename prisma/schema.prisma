@@ -1,0 +1,161 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum DriverStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum VehicleType {
+  CAR
+  MOTORCYCLE
+  LORRY
+  BUS
+  VAN
+}
+
+enum RoadCondition {
+  DRY
+  WET
+  FLOODED
+  UNDER_CONSTRUCTION
+  UNKNOWN
+}
+
+enum WeatherCondition {
+  CLEAR
+  RAINY
+  FOGGY
+  HAZY
+  NIGHT
+  UNKNOWN
+}
+
+enum InjuryStatus {
+  NONE
+  MINOR
+  SERIOUS
+}
+
+enum WritStatus {
+  DRAFT
+  SEALED
+}
+
+enum InsurerStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+// ─── INSURER ─────────────────────────────────────────────────────────────────
+model Insurer {
+  id                 Int           @id @default(autoincrement())
+  name               String
+  code               String        @unique
+  email              String        @unique
+  contactPerson      String        @map("contact_person")
+  phone              String
+  passwordHash       String        @map("password_hash")
+  mustChangePassword Boolean       @default(true) @map("must_change_password")
+  resetToken         String?       @unique @map("reset_token")
+  resetTokenExpiry   DateTime?     @map("reset_token_expiry")
+  status             InsurerStatus @default(ACTIVE)
+  revenueShare       Decimal       @default(50.00) @db.Decimal(10,2) @map("revenue_share")
+  awasShare          Decimal       @default(70.00) @db.Decimal(10,2) @map("awas_share")
+  policyFee          Decimal       @default(120.00) @db.Decimal(10,2) @map("policy_fee")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  drivers            Driver[]
+  invoices           Invoice[]
+
+  @@map("insurers")
+}
+
+// ─── DRIVER ──────────────────────────────────────────────────────────────────
+model Driver {
+  id                 Int           @id @default(autoincrement())
+  insurerId          Int           @map("insurer_id")
+  insurer            Insurer       @relation(fields: [insurerId], references: [id])
+  vehiclePlate       String        @unique @map("vehicle_plate")
+  vehicleMakeModel   String        @map("vehicle_make_model")
+  vehicleType        VehicleType   @default(CAR) @map("vehicle_type")
+  mykadLastFour      String        @map("mykad_last_four")
+  phone              String
+  email              String
+  passwordHash       String?       @map("password_hash")
+  mustChangePassword Boolean       @default(true) @map("must_change_password")
+  resetToken         String?       @unique @map("reset_token")
+  resetTokenExpiry   DateTime?     @map("reset_token_expiry")
+  policyNumber       String        @unique @map("policy_number")
+  policyExpiry       DateTime      @map("policy_expiry")
+  status             DriverStatus  @default(ACTIVE)
+  createdAt          DateTime      @default(now()) @map("created_at")
+  accidentLogs       AccidentLog[]
+
+  @@map("drivers")
+}
+
+// ─── ACCIDENT LOG ─────────────────────────────────────────────────────────────
+model AccidentLog {
+  id                    Int              @id @default(autoincrement())
+  writNumber            String           @unique @map("writ_number")
+  logHash               String           @unique @map("log_hash")
+  vehiclePlate          String           @map("vehicle_plate")
+  driver                Driver           @relation(fields: [vehiclePlate], references: [vehiclePlate])
+  videoUrl              String           @map("video_url")
+  rawVideoUrl           String?          @map("raw_video_url")
+  videoHash             String?          @map("video_hash")
+  imageUrls             Json?            @map("image_urls")
+  imageHashes           Json?            @map("image_hashes")
+  latitude              Decimal          @db.Decimal(10,8)
+  longitude             Decimal          @db.Decimal(11,8)
+  incidentDescription   String?          @map("incident_description")
+  roadCondition         RoadCondition    @default(UNKNOWN) @map("road_condition")
+  weatherCondition      WeatherCondition @default(UNKNOWN) @map("weather_condition")
+  injuryStatus          InjuryStatus     @default(NONE) @map("injury_status")
+  otherVehiclePlate     String?          @map("other_vehicle_plate")
+  otherVehicleMakeModel String?          @map("other_vehicle_make_model")
+  otherVehicleHash      String?          @unique @map("other_vehicle_hash")
+  writStatus            WritStatus       @default(DRAFT) @map("writ_status")
+  videoSealedAt         DateTime?        @map("video_sealed_at")
+  createdAt             DateTime         @default(now()) @map("created_at")
+
+  @@map("accident_logs")
+}
+
+// ─── INVOICE ──────────────────────────────────────────────────────────────────
+model Invoice {
+  id            Int       @id @default(autoincrement())
+  invoiceNumber String    @unique @map("invoice_number")
+  insurerId     Int       @map("insurer_id")
+  insurer       Insurer   @relation(fields: [insurerId], references: [id])
+  periodStart   DateTime  @map("period_start")
+  periodEnd     DateTime  @map("period_end")
+  totalPolicies Int       @map("total_policies")
+  awasShare     Decimal   @db.Decimal(10,2) @map("awas_share")
+  totalAmount   Decimal   @db.Decimal(10,2) @map("total_amount")
+  isPaid        Boolean   @default(false) @map("is_paid")
+  paidAt        DateTime? @map("paid_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@map("invoices")
+}
+
+// ─── CSV UPLOAD LOG ───────────────────────────────────────────────────────────
+model CsvUpload {
+  id           Int      @id @default(autoincrement())
+  insurerId    Int      @map("insurer_id")
+  fileName     String   @map("file_name")
+  totalRows    Int      @map("total_rows")
+  successRows  Int      @map("success_rows")
+  failedRows   Int      @map("failed_rows")
+  uploadedAt   DateTime @default(now()) @map("uploaded_at")
+
+  @@map("csv_uploads")
+}
