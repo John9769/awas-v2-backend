@@ -144,8 +144,16 @@ exports.getWritDetail = async (req, res) => {
         const { id: insurerId } = req.insurer;
         const { writNumber } = req.params;
 
+        const parts = writNumber.split('-');
+        let normalizedWritNumber;
+        if (parts.length === 4) {
+            normalizedWritNumber = parts[0] + '/' + parts[1] + '/' + parts[2] + '/' + parts[3];
+        } else {
+            normalizedWritNumber = writNumber;
+        }
+
         const log = await prisma.accidentLog.findUnique({
-            where: { writNumber },
+            where: { writNumber: normalizedWritNumber },
             include: {
                 driver: {
                     select: {
