@@ -71,28 +71,55 @@ enum InsurerStatus {
   SUSPENDED
 }
 
+enum InsurerRole {
+  HOC
+  OFFICER
+  BACKROOM
+  ACCOUNTS
+}
+
+enum InsurerUserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
 // ─── INSURER ─────────────────────────────────────────────────────────────────
 model Insurer {
-  id                 Int           @id @default(autoincrement())
-  name               String
-  code               String        @unique
-  email              String        @unique
-  contactPerson      String        @map("contact_person")
-  phone              String
-  passwordHash       String        @map("password_hash")
-  mustChangePassword Boolean       @default(true) @map("must_change_password")
-  resetToken         String?       @unique @map("reset_token")
-  resetTokenExpiry   DateTime?     @map("reset_token_expiry")
-  status             InsurerStatus @default(ACTIVE)
-  onboardingFee      Decimal       @default(40.00) @db.Decimal(10,2) @map("onboarding_fee")
-  writFee            Decimal       @default(9.90) @db.Decimal(10,2) @map("writ_fee")
-  createdAt          DateTime      @default(now()) @map("created_at")
-  drivers            Driver[]
-  invoices           Invoice[]
-  csvUploads         CsvUpload[]
-  writRebates        WritRebate[]
+  id               Int               @id @default(autoincrement())
+  name             String
+  code             String            @unique
+  email            String            @unique
+  contactPerson    String            @map("contact_person")
+  phone            String
+  status           InsurerStatus     @default(ACTIVE)
+  onboardingFee    Decimal           @default(40.00) @db.Decimal(10,2) @map("onboarding_fee")
+  writFee          Decimal           @default(9.90) @db.Decimal(10,2) @map("writ_fee")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  drivers          Driver[]
+  invoices         Invoice[]
+  csvUploads       CsvUpload[]
+  writRebates      WritRebate[]
+  insurerUsers     InsurerUser[]
 
   @@map("insurers")
+}
+
+// ─── INSURER USER ─────────────────────────────────────────────────────────────
+model InsurerUser {
+  id                 Int               @id @default(autoincrement())
+  insurerId          Int               @map("insurer_id")
+  insurer            Insurer           @relation(fields: [insurerId], references: [id])
+  name               String
+  email              String            @unique
+  passwordHash       String            @map("password_hash")
+  role               InsurerRole
+  mustChangePassword Boolean           @default(true) @map("must_change_password")
+  resetToken         String?           @unique @map("reset_token")
+  resetTokenExpiry   DateTime?         @map("reset_token_expiry")
+  status             InsurerUserStatus @default(ACTIVE)
+  createdAt          DateTime          @default(now()) @map("created_at")
+
+  @@map("insurer_users")
 }
 
 // ─── DRIVER ──────────────────────────────────────────────────────────────────

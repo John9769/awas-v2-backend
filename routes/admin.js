@@ -15,6 +15,10 @@ router.post('/insurers', adminController.createInsurer);
 router.get('/insurers', adminController.getInsurers);
 router.patch('/insurers/:id/toggle-status', adminController.toggleInsurerStatus);
 
+// Insurer user management — admin creates HOC only
+router.post('/insurer-users/hoc', adminController.createHocUser);
+router.get('/insurer-users', adminController.getInsurerUsers);
+
 // Driver management
 router.get('/drivers', adminController.getDrivers);
 

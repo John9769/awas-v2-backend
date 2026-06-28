@@ -36,7 +36,8 @@ exports.getDashboard = async (req, res) => {
             newWritsToday,
             newWritsMonth,
             totalInvoices,
-            unpaidInvoices
+            unpaidInvoices,
+            totalInsurerUsers
         ] = await Promise.all([
             prisma.insurer.count(),
             prisma.insurer.count({ where: { status: 'ACTIVE' } }),
@@ -49,14 +50,16 @@ exports.getDashboard = async (req, res) => {
             prisma.accidentLog.count({ where: { createdAt: { gte: today } } }),
             prisma.accidentLog.count({ where: { createdAt: { gte: thisMonth } } }),
             prisma.invoice.count(),
-            prisma.invoice.count({ where: { isPaid: false } })
+            prisma.invoice.count({ where: { isPaid: false } }),
+            prisma.insurerUser.count()
         ]);
 
         return res.status(200).json({
             insurers: { total: totalInsurers, active: activeInsurers },
             drivers: { total: totalDrivers, active: activeDrivers, newToday: newDriversToday, newMonth: newDriversMonth },
             writs: { total: totalWrits, submitted: submittedWrits, newToday: newWritsToday, newMonth: newWritsMonth },
-            invoices: { total: totalInvoices, unpaid: unpaidInvoices }
+            invoices: { total: totalInvoices, unpaid: unpaidInvoices },
+            insurerUsers: { total: totalInsurerUsers }
         });
 
     } catch (error) {
@@ -81,9 +84,6 @@ exports.createInsurer = async (req, res) => {
             return res.status(409).json({ error: 'Emel atau kod insurans sudah wujud.' });
         }
 
-        const tempPassword = generateTempPassword();
-        const passwordHash = await bcrypt.hash(tempPassword, 12);
-
         const insurer = await prisma.insurer.create({
             data: {
                 name,
@@ -91,28 +91,81 @@ exports.createInsurer = async (req, res) => {
                 email: email.toLowerCase(),
                 contactPerson,
                 phone,
-                passwordHash,
-                mustChangePassword: true,
                 onboardingFee: onboardingFee || 40.00,
                 writFee: writFee || 9.90
+            }
+        });
+
+        console.log(`AWAS V2: Insurer ${insurer.name} created.`);
+
+        return res.status(201).json({
+            message: `Insurans ${insurer.name} berjaya dicipta. Sila cipta pengguna HOC untuk insurans ini.`,
+            insurerId: insurer.id,
+            code: insurer.code
+        });
+
+    } catch (error) {
+        console.error('AWAS V2 Create Insurer Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── CREATE HOC USER FOR INSURER — ADMIN ONLY ─────────────────────────────────
+exports.createHocUser = async (req, res) => {
+    try {
+        const { insurerId, name, email } = req.body;
+
+        if (!insurerId || !name || !email) {
+            return res.status(400).json({ error: 'insurerId, nama dan emel diperlukan.' });
+        }
+
+        const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(insurerId) } });
+        if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
+
+        const existing = await prisma.insurerUser.findUnique({
+            where: { email: email.toLowerCase() }
+        });
+        if (existing) return res.status(409).json({ error: 'Emel sudah digunakan.' });
+
+        // Check if HOC already exists for this insurer
+        const existingHoc = await prisma.insurerUser.findFirst({
+            where: { insurerId: parseInt(insurerId), role: 'HOC' }
+        });
+        if (existingHoc) return res.status(409).json({ error: 'HOC sudah wujud untuk insurans ini.' });
+
+        const tempPassword = generateTempPassword();
+        const passwordHash = await bcrypt.hash(tempPassword, 12);
+
+        const hocUser = await prisma.insurerUser.create({
+            data: {
+                insurerId: parseInt(insurerId),
+                name,
+                email: email.toLowerCase(),
+                passwordHash,
+                role: 'HOC',
+                mustChangePassword: true,
+                status: 'ACTIVE'
             }
         });
 
         try {
             await resend.emails.send({
                 from: 'AWAS <hello@awas.asia>',
-                to: insurer.email,
-                subject: '[AWAS] Selamat Datang ke Portal Insurans AWAS',
+                to: hocUser.email,
+                subject: '[AWAS] Akaun Head of Claims Portal AWAS',
                 html: `
                     <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">Selamat Datang, ${insurer.name}</h2>
-                    <p>Akaun portal insurans AWAS anda telah berjaya dicipta.</p>
+                    <h2 style="color:#0f172a;">Selamat Datang ke Portal AWAS</h2>
+                    <p>Anda telah dilantik sebagai <strong>Head of Claims (HOC)</strong> untuk <strong>${insurer.name}</strong>.</p>
                     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Portal URL</td><td style="padding:8px;">${process.env.FE_URL}/insurer/login</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Emel</td><td style="padding:8px;">${insurer.email}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nama</td><td style="padding:8px;">${hocUser.name}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Emel</td><td style="padding:8px;">${hocUser.email}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Peranan</td><td style="padding:8px;font-weight:800;color:#16a34a;">HEAD OF CLAIMS</td></tr>
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Kata Laluan Sementara</td><td style="padding:8px;font-weight:800;color:#dc2626;">${tempPassword}</td></tr>
                     </table>
                     <p style="color:#dc2626;font-weight:700;">Sila tukar kata laluan anda selepas log masuk pertama.</p>
+                    <p>Sebagai HOC, anda boleh mencipta pengguna lain (Officer, Backroom, Accounts) dari dalam portal.</p>
                     <div style="margin:24px 0;">
                         <a href="${process.env.FE_URL}/insurer/login" style="background:#0f1623;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Log Masuk Portal</a>
                     </div>
@@ -121,19 +174,19 @@ exports.createInsurer = async (req, res) => {
                 `
             });
         } catch (emailErr) {
-            console.error('AWAS V2: Insurer welcome email fault:', emailErr);
+            console.error('AWAS V2: HOC welcome email fault:', emailErr);
         }
 
-        console.log(`AWAS V2: Insurer ${insurer.name} created. Temp password: ${tempPassword}`);
+        console.log(`AWAS V2: HOC user ${hocUser.name} created for insurer ${insurer.name}`);
 
         return res.status(201).json({
-            message: `Insurans ${insurer.name} berjaya dicipta. Emel selamat datang telah dihantar.`,
-            insurerId: insurer.id,
-            code: insurer.code
+            message: `HOC ${name} berjaya dicipta untuk ${insurer.name}. Emel selamat datang telah dihantar.`,
+            userId: hocUser.id,
+            role: hocUser.role
         });
 
     } catch (error) {
-        console.error('AWAS V2 Create Insurer Fault:', error);
+        console.error('AWAS V2 Create HOC User Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -148,10 +201,32 @@ exports.getInsurers = async (req, res) => {
                 contactPerson: true, phone: true, status: true,
                 onboardingFee: true, writFee: true,
                 createdAt: true,
-                _count: { select: { drivers: true, invoices: true } }
+                _count: { select: { drivers: true, invoices: true, insurerUsers: true } }
             }
         });
         return res.status(200).json({ count: insurers.length, insurers });
+    } catch (error) {
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── GET INSURER USERS — ADMIN VIEW ──────────────────────────────────────────
+exports.getInsurerUsers = async (req, res) => {
+    try {
+        const { insurerId } = req.query;
+        const where = insurerId ? { insurerId: parseInt(insurerId) } : {};
+
+        const users = await prisma.insurerUser.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            select: {
+                id: true, name: true, email: true, role: true,
+                status: true, mustChangePassword: true, createdAt: true,
+                insurer: { select: { name: true, code: true } }
+            }
+        });
+
+        return res.status(200).json({ count: users.length, users });
     } catch (error) {
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
@@ -173,7 +248,7 @@ exports.toggleInsurerStatus = async (req, res) => {
     }
 };
 
-// ─── CSV UPLOAD — BULK CREATE DRIVERS ────────────────────────────────────────
+// ─── CSV UPLOAD — ADMIN ───────────────────────────────────────────────────────
 exports.uploadCsv = async (req, res) => {
     try {
         const { insurerId } = req.body;
@@ -291,7 +366,6 @@ exports.uploadCsv = async (req, res) => {
             }
         }
 
-        // Log CSV upload
         await prisma.csvUpload.create({
             data: {
                 insurerId: parseInt(insurerId),
@@ -302,7 +376,6 @@ exports.uploadCsv = async (req, res) => {
             }
         });
 
-        // Auto-generate ONBOARDING invoice for new drivers only
         if (newDriversCount > 0) {
             const invoiceNumber = await generateInvoiceNumber();
             const unitFee = parseFloat(insurer.onboardingFee);
@@ -322,7 +395,7 @@ exports.uploadCsv = async (req, res) => {
                 }
             });
 
-            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} generated — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
+            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
         }
 
         return res.status(200).json({
@@ -411,7 +484,6 @@ exports.generateWritInvoice = async (req, res) => {
         const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(insurerId) } });
         if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
 
-        // Count submitted writs in period
         const submittedWrits = await prisma.accidentLog.count({
             where: {
                 driver: { insurerId: parseInt(insurerId) },
@@ -431,7 +503,7 @@ exports.generateWritInvoice = async (req, res) => {
         const totalAmount = unitFee * submittedWrits;
         const invoiceNumber = await generateInvoiceNumber();
 
-        const invoice = await prisma.invoice.create({
+        await prisma.invoice.create({
             data: {
                 invoiceNumber,
                 insurerId: parseInt(insurerId),
@@ -477,15 +549,7 @@ exports.generateWritInvoice = async (req, res) => {
 
         return res.status(201).json({
             message: `Invois writ ${invoiceNumber} berjaya dijana.`,
-            invoice: {
-                invoiceNumber,
-                invoiceType: 'WRIT',
-                submittedWrits,
-                unitFee,
-                totalAmount,
-                periodStart,
-                periodEnd
-            }
+            invoice: { invoiceNumber, invoiceType: 'WRIT', submittedWrits, unitFee, totalAmount, periodStart, periodEnd }
         });
 
     } catch (error) {
