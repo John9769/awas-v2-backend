@@ -34,7 +34,6 @@ exports.getProfile = async (req, res) => {
             return res.status(404).json({ error: 'Akaun tidak dijumpai.' });
         }
 
-        // Check policy expiry status
         const isExpired = new Date() > new Date(driver.policyExpiry);
         const daysLeft = Math.ceil((new Date(driver.policyExpiry) - new Date()) / (1000 * 60 * 60 * 24));
 
@@ -64,15 +63,18 @@ exports.getMyHistory = async (req, res) => {
                 logHash: true,
                 videoHash: true,
                 imageHashes: true,
+                audioHash: true,
                 latitude: true,
                 longitude: true,
                 roadCondition: true,
                 weatherCondition: true,
                 injuryStatus: true,
                 incidentDescription: true,
+                claimType: true,
                 otherVehiclePlate: true,
                 otherVehicleMakeModel: true,
-                writStatus: true,
+                writStage: true,
+                submittedAt: true,
                 videoSealedAt: true,
                 createdAt: true
             }

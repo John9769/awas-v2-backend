@@ -21,12 +21,12 @@ router.get('/drivers', adminController.getDrivers);
 // Writs
 router.get('/writs', adminController.getWrits);
 
-// CSV upload — multer handles file before controller
+// CSV upload
 router.post('/csv-upload', uploadCsv, adminController.uploadCsv);
 router.get('/csv-uploads', adminController.getCsvUploads);
 
 // Invoices
-router.post('/invoices/generate', adminController.generateInvoice);
+router.post('/invoices/generate-writ', adminController.generateWritInvoice);
 router.get('/invoices', adminController.getInvoices);
 router.patch('/invoices/:id/mark-paid', adminController.markInvoicePaid);
 

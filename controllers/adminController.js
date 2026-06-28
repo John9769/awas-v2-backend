@@ -32,6 +32,7 @@ exports.getDashboard = async (req, res) => {
             newDriversToday,
             newDriversMonth,
             totalWrits,
+            submittedWrits,
             newWritsToday,
             newWritsMonth,
             totalInvoices,
@@ -44,6 +45,7 @@ exports.getDashboard = async (req, res) => {
             prisma.driver.count({ where: { createdAt: { gte: today } } }),
             prisma.driver.count({ where: { createdAt: { gte: thisMonth } } }),
             prisma.accidentLog.count(),
+            prisma.accidentLog.count({ where: { writStage: 'SUBMITTED' } }),
             prisma.accidentLog.count({ where: { createdAt: { gte: today } } }),
             prisma.accidentLog.count({ where: { createdAt: { gte: thisMonth } } }),
             prisma.invoice.count(),
@@ -53,7 +55,7 @@ exports.getDashboard = async (req, res) => {
         return res.status(200).json({
             insurers: { total: totalInsurers, active: activeInsurers },
             drivers: { total: totalDrivers, active: activeDrivers, newToday: newDriversToday, newMonth: newDriversMonth },
-            writs: { total: totalWrits, newToday: newWritsToday, newMonth: newWritsMonth },
+            writs: { total: totalWrits, submitted: submittedWrits, newToday: newWritsToday, newMonth: newWritsMonth },
             invoices: { total: totalInvoices, unpaid: unpaidInvoices }
         });
 
@@ -66,7 +68,7 @@ exports.getDashboard = async (req, res) => {
 // ─── CREATE INSURER ───────────────────────────────────────────────────────────
 exports.createInsurer = async (req, res) => {
     try {
-        const { name, code, email, contactPerson, phone, revenueShare, awasShare, policyFee } = req.body;
+        const { name, code, email, contactPerson, phone, onboardingFee, writFee } = req.body;
 
         if (!name || !code || !email || !contactPerson || !phone) {
             return res.status(400).json({ error: 'Semua medan wajib diperlukan.' });
@@ -91,9 +93,8 @@ exports.createInsurer = async (req, res) => {
                 phone,
                 passwordHash,
                 mustChangePassword: true,
-                revenueShare: revenueShare || 50.00,
-                awasShare: awasShare || 70.00,
-                policyFee: policyFee || 120.00
+                onboardingFee: onboardingFee || 40.00,
+                writFee: writFee || 9.90
             }
         });
 
@@ -107,14 +108,15 @@ exports.createInsurer = async (req, res) => {
                     <h2 style="color:#0f172a;">Selamat Datang, ${insurer.name}</h2>
                     <p>Akaun portal insurans AWAS anda telah berjaya dicipta.</p>
                     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Portal URL</td><td style="padding:8px;">${process.env.FE_URL}/insurer</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Portal URL</td><td style="padding:8px;">${process.env.FE_URL}/insurer/login</td></tr>
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Emel</td><td style="padding:8px;">${insurer.email}</td></tr>
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Kata Laluan Sementara</td><td style="padding:8px;font-weight:800;color:#dc2626;">${tempPassword}</td></tr>
                     </table>
                     <p style="color:#dc2626;font-weight:700;">Sila tukar kata laluan anda selepas log masuk pertama.</p>
                     <div style="margin:24px 0;">
-                        <a href="${process.env.FE_URL}/insurer" style="background:#0f1623;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Log Masuk Portal</a>
+                        <a href="${process.env.FE_URL}/insurer/login" style="background:#0f1623;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Log Masuk Portal</a>
                     </div>
+                    <p style="font-size:0.75rem;color:#94a3b8;">Kadar Onboarding: RM${parseFloat(insurer.onboardingFee).toFixed(2)}/polisi | Kadar Writ: RM${parseFloat(insurer.writFee).toFixed(2)}/writ</p>
                     </div>
                 `
             });
@@ -144,7 +146,7 @@ exports.getInsurers = async (req, res) => {
             select: {
                 id: true, name: true, code: true, email: true,
                 contactPerson: true, phone: true, status: true,
-                revenueShare: true, awasShare: true, policyFee: true,
+                onboardingFee: true, writFee: true,
                 createdAt: true,
                 _count: { select: { drivers: true, invoices: true } }
             }
@@ -172,56 +174,40 @@ exports.toggleInsurerStatus = async (req, res) => {
 };
 
 // ─── CSV UPLOAD — BULK CREATE DRIVERS ────────────────────────────────────────
-// Insurer uploads actual .csv file daily
-// CSV columns: vehiclePlate, vehicleMakeModel, vehicleType, mykadLastFour,
-//              phone, email, policyNumber, policyExpiry
 exports.uploadCsv = async (req, res) => {
     try {
         const { insurerId } = req.body;
 
-        if (!insurerId) {
-            return res.status(400).json({ error: 'insurerId diperlukan.' });
-        }
-
-        if (!req.file) {
-            return res.status(400).json({ error: 'Fail CSV diperlukan.' });
-        }
+        if (!insurerId) return res.status(400).json({ error: 'insurerId diperlukan.' });
+        if (!req.file) return res.status(400).json({ error: 'Fail CSV diperlukan.' });
 
         const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(insurerId) } });
         if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
 
-        // Parse CSV from buffer
         const csvContent = req.file.buffer.toString('utf8');
         const lines = csvContent.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-        if (lines.length < 2) {
-            return res.status(400).json({ error: 'CSV kosong atau tiada data.' });
-        }
+        if (lines.length < 2) return res.status(400).json({ error: 'CSV kosong atau tiada data.' });
 
-        // First line = headers
         const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/\s+/g, ''));
-
-        // Validate required headers
         const required = ['vehicleplate', 'email', 'policynumber', 'policyexpiry'];
         const missingHeaders = required.filter(r => !headers.includes(r));
         if (missingHeaders.length > 0) {
             return res.status(400).json({ error: `Header CSV tidak lengkap. Missing: ${missingHeaders.join(', ')}` });
         }
 
-        // Parse data rows
         const rows = [];
         for (let i = 1; i < lines.length; i++) {
             const values = lines[i].split(',').map(v => v.trim());
             const row = {};
-            headers.forEach((h, idx) => {
-                row[h] = values[idx] || '';
-            });
+            headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
             rows.push(row);
         }
 
         let successRows = 0;
         let failedRows = 0;
         const errors = [];
+        let newDriversCount = 0;
 
         for (const row of rows) {
             try {
@@ -232,11 +218,10 @@ exports.uploadCsv = async (req, res) => {
 
                 if (!plate || !email || !policyNumber || !policyExpiry) {
                     failedRows++;
-                    errors.push(`Row ${successRows + failedRows} skipped — missing required fields: ${plate || 'no plate'}`);
+                    errors.push(`Row skipped — missing required fields: ${plate || 'no plate'}`);
                     continue;
                 }
 
-                // Check existing — update if exists
                 const existing = await prisma.driver.findFirst({
                     where: { OR: [{ vehiclePlate: plate }, { policyNumber }] }
                 });
@@ -244,17 +229,12 @@ exports.uploadCsv = async (req, res) => {
                 if (existing) {
                     await prisma.driver.update({
                         where: { vehiclePlate: plate },
-                        data: {
-                            policyExpiry: new Date(policyExpiry),
-                            policyNumber,
-                            status: 'ACTIVE'
-                        }
+                        data: { policyExpiry: new Date(policyExpiry), policyNumber, status: 'ACTIVE' }
                     });
                     successRows++;
                     continue;
                 }
 
-                // Create new driver
                 const tempPassword = generateTempPassword();
                 const passwordHash = await bcrypt.hash(tempPassword, 12);
 
@@ -275,7 +255,8 @@ exports.uploadCsv = async (req, res) => {
                     }
                 });
 
-                // Send welcome email
+                newDriversCount++;
+
                 try {
                     await resend.emails.send({
                         from: 'AWAS <hello@awas.asia>',
@@ -321,12 +302,34 @@ exports.uploadCsv = async (req, res) => {
             }
         });
 
-        console.log(`AWAS V2: CSV upload for insurer ${insurerId} — ${successRows} success, ${failedRows} failed`);
+        // Auto-generate ONBOARDING invoice for new drivers only
+        if (newDriversCount > 0) {
+            const invoiceNumber = await generateInvoiceNumber();
+            const unitFee = parseFloat(insurer.onboardingFee);
+            const totalAmount = unitFee * newDriversCount;
+            const now = new Date();
+
+            await prisma.invoice.create({
+                data: {
+                    invoiceNumber,
+                    insurerId: parseInt(insurerId),
+                    invoiceType: 'ONBOARDING',
+                    periodStart: now,
+                    periodEnd: now,
+                    totalUnits: newDriversCount,
+                    unitFee,
+                    totalAmount
+                }
+            });
+
+            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} generated — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
+        }
 
         return res.status(200).json({
             message: `CSV diproses. ${successRows} berjaya, ${failedRows} gagal.`,
             successRows,
             failedRows,
+            newDriversCount,
             errors: errors.length > 0 ? errors : undefined
         });
 
@@ -368,100 +371,15 @@ exports.getWrits = async (req, res) => {
             orderBy: { createdAt: 'desc' },
             select: {
                 id: true, writNumber: true, vehiclePlate: true,
-                writStatus: true, logHash: true, videoHash: true,
-                latitude: true, longitude: true,
+                writStage: true, logHash: true, videoHash: true,
+                latitude: true, longitude: true, claimType: true,
                 roadCondition: true, weatherCondition: true, injuryStatus: true,
-                createdAt: true,
+                submittedAt: true, createdAt: true,
                 driver: { select: { insurer: { select: { name: true, code: true } } } }
             }
         });
         return res.status(200).json({ count: writs.length, writs });
     } catch (error) {
-        return res.status(500).json({ error: 'Ralat pelayan.' });
-    }
-};
-
-// ─── GENERATE INVOICE ─────────────────────────────────────────────────────────
-exports.generateInvoice = async (req, res) => {
-    try {
-        const { insurerId, periodStart, periodEnd } = req.body;
-
-        if (!insurerId || !periodStart || !periodEnd) {
-            return res.status(400).json({ error: 'insurerId, periodStart dan periodEnd diperlukan.' });
-        }
-
-        const insurer = await prisma.insurer.findUnique({
-            where: { id: parseInt(insurerId) }
-        });
-        if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
-
-        const totalPolicies = await prisma.driver.count({
-            where: {
-                insurerId: parseInt(insurerId),
-                status: 'ACTIVE'
-            }
-        });
-
-        const awasShare = parseFloat(insurer.awasShare);
-        const totalAmount = awasShare * totalPolicies;
-        const invoiceNumber = await generateInvoiceNumber();
-
-        const invoice = await prisma.invoice.create({
-            data: {
-                invoiceNumber,
-                insurerId: parseInt(insurerId),
-                periodStart: new Date(periodStart),
-                periodEnd: new Date(periodEnd),
-                totalPolicies,
-                awasShare,
-                totalAmount
-            }
-        });
-
-        try {
-            await resend.emails.send({
-                from: 'AWAS <hello@awas.asia>',
-                to: insurer.email,
-                subject: `[AWAS] Invois ${invoiceNumber}`,
-                html: `
-                    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">Invois AWAS</h2>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Invois</td><td style="padding:8px;font-weight:800;">${invoiceNumber}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Syarikat</td><td style="padding:8px;">${insurer.name}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tempoh</td><td style="padding:8px;">${new Date(periodStart).toLocaleDateString('ms-MY')} — ${new Date(periodEnd).toLocaleDateString('ms-MY')}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jumlah Polisi Aktif</td><td style="padding:8px;">${totalPolicies}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Kadar AWAS</td><td style="padding:8px;">RM${awasShare.toFixed(2)} / polisi</td></tr>
-                        <tr style="background:#f0fdf4;"><td style="padding:12px;font-weight:800;font-size:1.1rem;">JUMLAH PERLU DIBAYAR</td><td style="padding:12px;font-weight:800;font-size:1.1rem;color:#16a34a;">RM${totalAmount.toFixed(2)}</td></tr>
-                    </table>
-                    <p>Sila buat pembayaran kepada:</p>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;background:#f8fafc;">
-                        <tr><td style="padding:8px;font-weight:700;">Nama Syarikat</td><td style="padding:8px;">AWAS Premium Resources</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;">No. SSM</td><td style="padding:8px;">202603141446</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;">Emel</td><td style="padding:8px;">hello@awas.asia</td></tr>
-                    </table>
-                    <p style="font-size:0.8rem;color:#64748b;">Invois ini dijana secara automatik oleh sistem AWAS.</p>
-                    </div>
-                `
-            });
-        } catch (emailErr) {
-            console.error('AWAS V2: Invoice email fault:', emailErr);
-        }
-
-        return res.status(201).json({
-            message: `Invois ${invoiceNumber} berjaya dijana dan dihantar kepada ${insurer.email}.`,
-            invoice: {
-                invoiceNumber,
-                totalPolicies,
-                awasShare,
-                totalAmount,
-                periodStart,
-                periodEnd
-            }
-        });
-
-    } catch (error) {
-        console.error('AWAS V2 Generate Invoice Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -477,6 +395,101 @@ exports.getInvoices = async (req, res) => {
         });
         return res.status(200).json({ count: invoices.length, invoices });
     } catch (error) {
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── GENERATE WRIT INVOICE ────────────────────────────────────────────────────
+exports.generateWritInvoice = async (req, res) => {
+    try {
+        const { insurerId, periodStart, periodEnd } = req.body;
+
+        if (!insurerId || !periodStart || !periodEnd) {
+            return res.status(400).json({ error: 'insurerId, periodStart dan periodEnd diperlukan.' });
+        }
+
+        const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(insurerId) } });
+        if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
+
+        // Count submitted writs in period
+        const submittedWrits = await prisma.accidentLog.count({
+            where: {
+                driver: { insurerId: parseInt(insurerId) },
+                writStage: 'SUBMITTED',
+                submittedAt: {
+                    gte: new Date(periodStart),
+                    lte: new Date(periodEnd)
+                }
+            }
+        });
+
+        if (submittedWrits === 0) {
+            return res.status(400).json({ error: 'Tiada writ submitted dalam tempoh ini.' });
+        }
+
+        const unitFee = parseFloat(insurer.writFee);
+        const totalAmount = unitFee * submittedWrits;
+        const invoiceNumber = await generateInvoiceNumber();
+
+        const invoice = await prisma.invoice.create({
+            data: {
+                invoiceNumber,
+                insurerId: parseInt(insurerId),
+                invoiceType: 'WRIT',
+                periodStart: new Date(periodStart),
+                periodEnd: new Date(periodEnd),
+                totalUnits: submittedWrits,
+                unitFee,
+                totalAmount
+            }
+        });
+
+        try {
+            await resend.emails.send({
+                from: 'AWAS <hello@awas.asia>',
+                to: insurer.email,
+                subject: `[AWAS] Invois Writ ${invoiceNumber}`,
+                html: `
+                    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
+                    <h2 style="color:#0f172a;">Invois Writ AWAS</h2>
+                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Invois</td><td style="padding:8px;font-weight:800;">${invoiceNumber}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Syarikat</td><td style="padding:8px;">${insurer.name}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jenis Invois</td><td style="padding:8px;">Writ Forensik</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tempoh</td><td style="padding:8px;">${new Date(periodStart).toLocaleDateString('ms-MY')} — ${new Date(periodEnd).toLocaleDateString('ms-MY')}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jumlah Writ Submitted</td><td style="padding:8px;">${submittedWrits}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Kadar Per Writ</td><td style="padding:8px;">RM${unitFee.toFixed(2)}</td></tr>
+                        <tr style="background:#f0fdf4;"><td style="padding:12px;font-weight:800;font-size:1.1rem;">JUMLAH PERLU DIBAYAR</td><td style="padding:12px;font-weight:800;font-size:1.1rem;color:#16a34a;">RM${totalAmount.toFixed(2)}</td></tr>
+                    </table>
+                    <p>Sila buat pembayaran kepada:</p>
+                    <table style="width:100%;border-collapse:collapse;margin:16px 0;background:#f8fafc;">
+                        <tr><td style="padding:8px;font-weight:700;">Nama Syarikat</td><td style="padding:8px;">AWAS Premium Resources</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;">No. SSM</td><td style="padding:8px;">202603141446</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;">Emel</td><td style="padding:8px;">hello@awas.asia</td></tr>
+                    </table>
+                    <p style="font-size:0.8rem;color:#64748b;">Invois ini dijana secara automatik oleh sistem AWAS.</p>
+                    </div>
+                `
+            });
+        } catch (emailErr) {
+            console.error('AWAS V2: Writ invoice email fault:', emailErr);
+        }
+
+        return res.status(201).json({
+            message: `Invois writ ${invoiceNumber} berjaya dijana.`,
+            invoice: {
+                invoiceNumber,
+                invoiceType: 'WRIT',
+                submittedWrits,
+                unitFee,
+                totalAmount,
+                periodStart,
+                periodEnd
+            }
+        });
+
+    } catch (error) {
+        console.error('AWAS V2 Generate Writ Invoice Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -505,7 +518,10 @@ exports.getCsvUploads = async (req, res) => {
     try {
         const uploads = await prisma.csvUpload.findMany({
             orderBy: { uploadedAt: 'desc' },
-            take: 50
+            take: 50,
+            include: {
+                insurer: { select: { name: true, code: true } }
+            }
         });
         return res.status(200).json({ count: uploads.length, uploads });
     } catch (error) {

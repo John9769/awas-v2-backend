@@ -5,6 +5,13 @@ const { Resend } = require('resend');
 const prisma = new PrismaClient();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// ─── HELPER: Generate invoice number ─────────────────────────────────────────
+async function generateInvoiceNumber() {
+    const year = new Date().getFullYear();
+    const count = await prisma.invoice.count();
+    return `AWAS-INV-${year}-${String(count + 1).padStart(4, '0')}`;
+}
+
 // ─── GET INSURER DASHBOARD ────────────────────────────────────────────────────
 exports.getDashboard = async (req, res) => {
     try {
@@ -18,9 +25,9 @@ exports.getDashboard = async (req, res) => {
             totalDrivers,
             activeDrivers,
             expiringDrivers,
-            totalWrits,
-            newWritsToday,
-            newWritsMonth,
+            totalSubmittedWrits,
+            submittedWritsToday,
+            submittedWritsMonth,
             unpaidInvoices
         ] = await Promise.all([
             prisma.driver.count({ where: { insurerId } }),
@@ -35,17 +42,26 @@ exports.getDashboard = async (req, res) => {
                     }
                 }
             }),
-            prisma.accidentLog.count({ where: { driver: { insurerId } } }),
-            prisma.accidentLog.count({ where: { driver: { insurerId }, createdAt: { gte: today } } }),
-            prisma.accidentLog.count({ where: { driver: { insurerId }, createdAt: { gte: thisMonth } } }),
+            prisma.accidentLog.count({
+                where: { driver: { insurerId }, writStage: 'SUBMITTED' }
+            }),
+            prisma.accidentLog.count({
+                where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: today } }
+            }),
+            prisma.accidentLog.count({
+                where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: thisMonth } }
+            }),
             prisma.invoice.count({ where: { insurerId, isPaid: false } })
         ]);
 
         return res.status(200).json({
             totalDrivers,
             activeDrivers,
-            totalWrits,
-            writsThisMonth: newWritsMonth,
+            expiringDrivers,
+            totalSubmittedWrits,
+            submittedWritsToday,
+            submittedWritsMonth,
+            unpaidInvoices,
             insurer: req.insurer
         });
 
@@ -97,25 +113,29 @@ exports.getMyDrivers = async (req, res) => {
     }
 };
 
-// ─── GET MY WRITS ─────────────────────────────────────────────────────────────
+// ─── GET MY WRITS — SUBMITTED ONLY ───────────────────────────────────────────
 exports.getMyWrits = async (req, res) => {
     try {
         const { id: insurerId } = req.insurer;
-        const { vehiclePlate, dateFrom, dateTo } = req.query;
+        const { vehiclePlate, dateFrom, dateTo, claimType } = req.query;
 
-        const where = { driver: { insurerId } };
+        const where = {
+            driver: { insurerId },
+            writStage: 'SUBMITTED'
+        };
 
         if (vehiclePlate) where.vehiclePlate = vehiclePlate.toUpperCase();
+        if (claimType) where.claimType = claimType;
 
         if (dateFrom || dateTo) {
-            where.createdAt = {};
-            if (dateFrom) where.createdAt.gte = new Date(dateFrom);
-            if (dateTo) where.createdAt.lte = new Date(dateTo);
+            where.submittedAt = {};
+            if (dateFrom) where.submittedAt.gte = new Date(dateFrom);
+            if (dateTo) where.submittedAt.lte = new Date(dateTo);
         }
 
         const writs = await prisma.accidentLog.findMany({
             where,
-            orderBy: { createdAt: 'desc' },
+            orderBy: { submittedAt: 'desc' },
             include: {
                 driver: {
                     select: {
@@ -166,12 +186,14 @@ exports.getWritDetail = async (req, res) => {
                         phone: true,
                         email: true
                     }
-                }
+                },
+                writRebate: true
             }
         });
 
         if (!log) return res.status(404).json({ error: 'Writ tidak dijumpai.' });
         if (log.driver.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+        if (log.writStage !== 'SUBMITTED') return res.status(403).json({ error: 'Writ belum disubmit.' });
 
         return res.status(200).json({ writ: log });
 
@@ -204,9 +226,7 @@ exports.uploadCsv = async (req, res) => {
     try {
         const { id: insurerId } = req.insurer;
 
-        if (!req.file) {
-            return res.status(400).json({ error: 'Fail CSV diperlukan.' });
-        }
+        if (!req.file) return res.status(400).json({ error: 'Fail CSV diperlukan.' });
 
         const insurer = await prisma.insurer.findUnique({ where: { id: insurerId } });
         if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
@@ -214,9 +234,7 @@ exports.uploadCsv = async (req, res) => {
         const csvContent = req.file.buffer.toString('utf8');
         const lines = csvContent.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-        if (lines.length < 2) {
-            return res.status(400).json({ error: 'CSV kosong atau tiada data.' });
-        }
+        if (lines.length < 2) return res.status(400).json({ error: 'CSV kosong atau tiada data.' });
 
         const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/\s+/g, ''));
         const required = ['vehicleplate', 'email', 'policynumber', 'policyexpiry'];
@@ -236,6 +254,7 @@ exports.uploadCsv = async (req, res) => {
         let successRows = 0;
         let failedRows = 0;
         const errors = [];
+        let newDriversCount = 0;
 
         for (const row of rows) {
             try {
@@ -283,6 +302,8 @@ exports.uploadCsv = async (req, res) => {
                     }
                 });
 
+                newDriversCount++;
+
                 try {
                     await resend.emails.send({
                         from: 'AWAS <hello@awas.asia>',
@@ -317,6 +338,7 @@ exports.uploadCsv = async (req, res) => {
             }
         }
 
+        // Log CSV upload
         await prisma.csvUpload.create({
             data: {
                 insurerId,
@@ -327,10 +349,34 @@ exports.uploadCsv = async (req, res) => {
             }
         });
 
+        // Auto-generate ONBOARDING invoice for new drivers only
+        if (newDriversCount > 0) {
+            const invoiceNumber = await generateInvoiceNumber();
+            const unitFee = parseFloat(insurer.onboardingFee);
+            const totalAmount = unitFee * newDriversCount;
+            const now = new Date();
+
+            await prisma.invoice.create({
+                data: {
+                    invoiceNumber,
+                    insurerId,
+                    invoiceType: 'ONBOARDING',
+                    periodStart: now,
+                    periodEnd: now,
+                    totalUnits: newDriversCount,
+                    unitFee,
+                    totalAmount
+                }
+            });
+
+            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
+        }
+
         return res.status(200).json({
             message: `CSV diproses. ${successRows} berjaya, ${failedRows} gagal.`,
             successRows,
             failedRows,
+            newDriversCount,
             errors: errors.length > 0 ? errors : undefined
         });
 

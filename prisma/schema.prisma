@@ -7,6 +7,8 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// ─── ENUMS ───────────────────────────────────────────────────────────────────
+
 enum DriverStatus {
   ACTIVE
   INACTIVE
@@ -44,9 +46,24 @@ enum InjuryStatus {
   SERIOUS
 }
 
-enum WritStatus {
+enum WritStage {
   DRAFT
-  SEALED
+  SUBMITTED
+}
+
+enum ClaimType {
+  OWN_DAMAGE
+  THIRD_PARTY
+}
+
+enum RebateType {
+  PERCENTAGE
+  FLAT
+}
+
+enum InvoiceType {
+  ONBOARDING
+  WRIT
 }
 
 enum InsurerStatus {
@@ -67,12 +84,13 @@ model Insurer {
   resetToken         String?       @unique @map("reset_token")
   resetTokenExpiry   DateTime?     @map("reset_token_expiry")
   status             InsurerStatus @default(ACTIVE)
-  revenueShare       Decimal       @default(50.00) @db.Decimal(10,2) @map("revenue_share")
-  awasShare          Decimal       @default(70.00) @db.Decimal(10,2) @map("awas_share")
-  policyFee          Decimal       @default(120.00) @db.Decimal(10,2) @map("policy_fee")
+  onboardingFee      Decimal       @default(40.00) @db.Decimal(10,2) @map("onboarding_fee")
+  writFee            Decimal       @default(9.90) @db.Decimal(10,2) @map("writ_fee")
   createdAt          DateTime      @default(now()) @map("created_at")
   drivers            Driver[]
   invoices           Invoice[]
+  csvUploads         CsvUpload[]
+  writRebates        WritRebate[]
 
   @@map("insurers")
 }
@@ -97,52 +115,79 @@ model Driver {
   status             DriverStatus  @default(ACTIVE)
   createdAt          DateTime      @default(now()) @map("created_at")
   accidentLogs       AccidentLog[]
+  writRebates        WritRebate[]
 
   @@map("drivers")
 }
 
 // ─── ACCIDENT LOG ─────────────────────────────────────────────────────────────
 model AccidentLog {
-  id                    Int              @id @default(autoincrement())
-  writNumber            String           @unique @map("writ_number")
-  logHash               String           @unique @map("log_hash")
-  vehiclePlate          String           @map("vehicle_plate")
-  driver                Driver           @relation(fields: [vehiclePlate], references: [vehiclePlate])
-  videoUrl              String           @map("video_url")
-  rawVideoUrl           String?          @map("raw_video_url")
-  videoHash             String?          @map("video_hash")
-  imageUrls             Json?            @map("image_urls")
-  imageHashes           Json?            @map("image_hashes")
-  latitude              Decimal          @db.Decimal(10,8)
-  longitude             Decimal          @db.Decimal(11,8)
-  incidentDescription   String?          @map("incident_description")
-  roadCondition         RoadCondition    @default(UNKNOWN) @map("road_condition")
-  weatherCondition      WeatherCondition @default(UNKNOWN) @map("weather_condition")
-  injuryStatus          InjuryStatus     @default(NONE) @map("injury_status")
-  otherVehiclePlate     String?          @map("other_vehicle_plate")
-  otherVehicleMakeModel String?          @map("other_vehicle_make_model")
-  otherVehicleHash      String?          @unique @map("other_vehicle_hash")
-  writStatus            WritStatus       @default(DRAFT) @map("writ_status")
-  videoSealedAt         DateTime?        @map("video_sealed_at")
-  createdAt             DateTime         @default(now()) @map("created_at")
+  id                       Int              @id @default(autoincrement())
+  writNumber               String           @unique @map("writ_number")
+  logHash                  String           @unique @map("log_hash")
+  vehiclePlate             String           @map("vehicle_plate")
+  driver                   Driver           @relation(fields: [vehiclePlate], references: [vehiclePlate])
+  writStage                WritStage        @default(DRAFT) @map("writ_stage")
+  submittedAt              DateTime?        @map("submitted_at")
+  claimType                ClaimType?       @map("claim_type")
+  videoUrl                 String?          @map("video_url")
+  rawVideoUrl              String?          @map("raw_video_url")
+  videoHash                String?          @map("video_hash")
+  imageUrls                Json?            @map("image_urls")
+  imageHashes              Json?            @map("image_hashes")
+  audioUrl                 String?          @map("audio_url")
+  audioHash                String?          @map("audio_hash")
+  latitude                 Decimal          @db.Decimal(10,8)
+  longitude                Decimal          @db.Decimal(11,8)
+  incidentDescription      String?          @map("incident_description")
+  roadCondition            RoadCondition    @default(UNKNOWN) @map("road_condition")
+  weatherCondition         WeatherCondition @default(UNKNOWN) @map("weather_condition")
+  injuryStatus             InjuryStatus     @default(NONE) @map("injury_status")
+  otherVehiclePlate        String?          @map("other_vehicle_plate")
+  otherVehicleMakeModel    String?          @map("other_vehicle_make_model")
+  otherVehicleImageUrls    Json?            @map("other_vehicle_image_urls")
+  otherVehicleImageHashes  Json?            @map("other_vehicle_image_hashes")
+  videoSealedAt            DateTime?        @map("video_sealed_at")
+  createdAt                DateTime         @default(now()) @map("created_at")
+  writRebate               WritRebate?
 
   @@map("accident_logs")
 }
 
+// ─── WRIT REBATE ──────────────────────────────────────────────────────────────
+model WritRebate {
+  id            Int         @id @default(autoincrement())
+  insurerId     Int         @map("insurer_id")
+  insurer       Insurer     @relation(fields: [insurerId], references: [id])
+  driverId      Int         @map("driver_id")
+  driver        Driver      @relation(fields: [driverId], references: [id])
+  accidentLogId Int         @unique @map("accident_log_id")
+  accidentLog   AccidentLog @relation(fields: [accidentLogId], references: [id])
+  claimType     ClaimType   @map("claim_type")
+  rebateType    RebateType  @map("rebate_type")
+  rebateValue   Decimal     @db.Decimal(10,2) @map("rebate_value")
+  isApplied     Boolean     @default(false) @map("is_applied")
+  appliedAt     DateTime?   @map("applied_at")
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  @@map("writ_rebates")
+}
+
 // ─── INVOICE ──────────────────────────────────────────────────────────────────
 model Invoice {
-  id            Int       @id @default(autoincrement())
-  invoiceNumber String    @unique @map("invoice_number")
-  insurerId     Int       @map("insurer_id")
-  insurer       Insurer   @relation(fields: [insurerId], references: [id])
-  periodStart   DateTime  @map("period_start")
-  periodEnd     DateTime  @map("period_end")
-  totalPolicies Int       @map("total_policies")
-  awasShare     Decimal   @db.Decimal(10,2) @map("awas_share")
-  totalAmount   Decimal   @db.Decimal(10,2) @map("total_amount")
-  isPaid        Boolean   @default(false) @map("is_paid")
-  paidAt        DateTime? @map("paid_at")
-  createdAt     DateTime  @default(now()) @map("created_at")
+  id            Int         @id @default(autoincrement())
+  invoiceNumber String      @unique @map("invoice_number")
+  insurerId     Int         @map("insurer_id")
+  insurer       Insurer     @relation(fields: [insurerId], references: [id])
+  invoiceType   InvoiceType @map("invoice_type")
+  periodStart   DateTime    @map("period_start")
+  periodEnd     DateTime    @map("period_end")
+  totalUnits    Int         @map("total_units")
+  unitFee       Decimal     @db.Decimal(10,2) @map("unit_fee")
+  totalAmount   Decimal     @db.Decimal(10,2) @map("total_amount")
+  isPaid        Boolean     @default(false) @map("is_paid")
+  paidAt        DateTime?   @map("paid_at")
+  createdAt     DateTime    @default(now()) @map("created_at")
 
   @@map("invoices")
 }
@@ -151,6 +196,7 @@ model Invoice {
 model CsvUpload {
   id           Int      @id @default(autoincrement())
   insurerId    Int      @map("insurer_id")
+  insurer      Insurer  @relation(fields: [insurerId], references: [id])
   fileName     String   @map("file_name")
   totalRows    Int      @map("total_rows")
   successRows  Int      @map("success_rows")
