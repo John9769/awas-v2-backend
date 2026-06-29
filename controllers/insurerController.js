@@ -290,7 +290,13 @@ exports.uploadCsv = async (req, res) => {
                 if (existing) {
                     await prisma.driver.update({
                         where: { vehiclePlate: plate },
-                        data: { policyExpiry: new Date(policyExpiry), policyNumber, status: 'ACTIVE' }
+                        data: {
+                            policyExpiry: new Date(policyExpiry),
+                            policyNumber,
+                            status: 'ACTIVE',
+                            vehicleMakeModel: row['vehiclemakemodel'] || existing.vehicleMakeModel,
+                            phone: row['phone'] || existing.phone
+                        }
                     });
                     successRows++;
                     continue;
