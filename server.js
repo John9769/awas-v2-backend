@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const https = require('https');
 
 dotenv.config();
 
@@ -47,6 +48,18 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
     console.log(`AWAS V2 Backend listening on port ${PORT}`);
+
+    // Keep-alive ping every 14 minutes to prevent Render cold start
+    if (process.env.BE_URL) {
+        setInterval(() => {
+            const url = `${process.env.BE_URL}/health`;
+            https.get(url, (res) => {
+                console.log(`AWAS V2: Keep-alive ping — ${res.statusCode}`);
+            }).on('error', (err) => {
+                console.error('AWAS V2: Keep-alive ping failed:', err.message);
+            });
+        }, 14 * 60 * 1000);
+    }
 });
 
 module.exports = app;
