@@ -2,10 +2,11 @@ const express = require('express');
 const router = express.Router();
 const logsController = require('../controllers/logsController');
 const auth = require('../middleware/auth');
-const { uploadEvidence } = require('../middleware/upload');
+const { uploadEvidence, uploadPoliceReport } = require('../middleware/upload');
 
 // Protected — driver JWT required
 router.post('/submit', auth, uploadEvidence, logsController.submitWrit);
+router.post('/police-report', auth, uploadPoliceReport, logsController.uploadPoliceReport);
 router.get('/my-writs', auth, logsController.getMyWrits);
 
 // Public — anyone with writ number can view

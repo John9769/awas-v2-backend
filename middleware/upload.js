@@ -37,3 +37,17 @@ exports.uploadEvidence = upload.fields([
 
 // CSV upload
 exports.uploadCsv = upload.single('csv');
+
+// V3: Police report upload (single image/PDF)
+exports.uploadPoliceReport = upload.fields([
+    { name: 'policeReport', maxCount: 1 }
+]);
+
+// V3: Settlement docs upload
+// IC + driving licence + VOC + discharge voucher
+exports.uploadSettlementDocs = upload.fields([
+    { name: 'ic', maxCount: 1 },
+    { name: 'licence', maxCount: 1 },
+    { name: 'voc', maxCount: 1 },
+    { name: 'dischargeVoucher', maxCount: 1 }
+]);

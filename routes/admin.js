@@ -34,4 +34,8 @@ router.post('/invoices/generate-writ', adminController.generateWritInvoice);
 router.get('/invoices', adminController.getInvoices);
 router.patch('/invoices/:id/mark-paid', adminController.markInvoicePaid);
 
+// V3: Pricing config
+router.get('/pricing', adminController.getPricing);
+router.put('/pricing', adminController.updatePricing);
+
 module.exports = router;

@@ -17,6 +17,15 @@ async function generateInvoiceNumber() {
     return `AWAS-INV-${year}-${String(count + 1).padStart(4, '0')}`;
 }
 
+// ─── HELPER: Get pricing from DB ─────────────────────────────────────────────
+async function getPricing(key, vehicleType) {
+    const config = await prisma.pricingConfig.findUnique({
+        where: { key_vehicleType: { key, vehicleType } }
+    });
+    if (!config) throw new Error(`PricingConfig missing: ${key} / ${vehicleType}`);
+    return parseFloat(config.amount);
+}
+
 // ─── GET INSURER DASHBOARD — HOC ONLY ────────────────────────────────────────
 exports.getDashboard = async (req, res) => {
     try {
@@ -34,7 +43,9 @@ exports.getDashboard = async (req, res) => {
             submittedWritsToday,
             submittedWritsMonth,
             unpaidInvoices,
-            totalUsers
+            totalUsers,
+            pendingSettlements,
+            acceptedSettlements
         ] = await Promise.all([
             prisma.driver.count({ where: { insurerId } }),
             prisma.driver.count({ where: { insurerId, status: 'ACTIVE' } }),
@@ -58,7 +69,17 @@ exports.getDashboard = async (req, res) => {
                 where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: thisMonth } }
             }),
             prisma.invoice.count({ where: { insurerId, isPaid: false } }),
-            prisma.insurerUser.count({ where: { insurerId } })
+            prisma.insurerUser.count({ where: { insurerId } }),
+            // V3: settlements awaiting HOC decision
+            prisma.cashSettlement.count({ where: { insurerId, status: 'PENDING' } }),
+            // V3: accepted settlements this month
+            prisma.cashSettlement.count({
+                where: {
+                    insurerId,
+                    status: 'ACCEPTED',
+                    policyholderDecidedAt: { gte: thisMonth }
+                }
+            })
         ]);
 
         const insurer = await prisma.insurer.findUnique({
@@ -75,12 +96,14 @@ exports.getDashboard = async (req, res) => {
             submittedWritsMonth,
             unpaidInvoices,
             totalUsers,
+            pendingSettlements,
+            acceptedSettlements,
             insurer,
             insurerUser: req.insurerUser
         });
 
     } catch (error) {
-        console.error('AWAS V2 Insurer Dashboard Fault:', error);
+        console.error('AWAS V3 Insurer Dashboard Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -122,7 +145,7 @@ exports.getMyDrivers = async (req, res) => {
         return res.status(200).json({ count: drivers.length, drivers });
 
     } catch (error) {
-        console.error('AWAS V2 getMyDrivers Fault:', error);
+        console.error('AWAS V3 getMyDrivers Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -160,6 +183,22 @@ exports.getMyWrits = async (req, res) => {
                         phone: true,
                         email: true
                     }
+                },
+                aiAssessment: {
+                    select: {
+                        status: true,
+                        totalEstimatedCost: true,
+                        overallSeverity: true,
+                        confidenceLevel: true,
+                        sentToInsurerAt: true
+                    }
+                },
+                cashSettlement: {
+                    select: {
+                        status: true,
+                        offeredAmount: true,
+                        offeredAt: true
+                    }
                 }
             }
         });
@@ -167,27 +206,25 @@ exports.getMyWrits = async (req, res) => {
         return res.status(200).json({ count: writs.length, writs });
 
     } catch (error) {
-        console.error('AWAS V2 getMyWrits Fault:', error);
+        console.error('AWAS V3 getMyWrits Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
 
 // ─── GET SINGLE WRIT DETAIL — HOC + OFFICER ──────────────────────────────────
+// V3: includes full aiAssessment and cashSettlement
 exports.getWritDetail = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
         const { writNumber } = req.params;
 
         const parts = writNumber.split('-');
-        let normalizedWritNumber;
-        if (parts.length === 4) {
-            normalizedWritNumber = parts[0] + '/' + parts[1] + '/' + parts[2] + '/' + parts[3];
-        } else {
-            normalizedWritNumber = writNumber;
-        }
+        const normalized = parts.length === 4
+            ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
+            : writNumber;
 
         const log = await prisma.accidentLog.findUnique({
-            where: { writNumber: normalizedWritNumber },
+            where: { writNumber: normalized },
             include: {
                 driver: {
                     select: {
@@ -201,7 +238,9 @@ exports.getWritDetail = async (req, res) => {
                         email: true
                     }
                 },
-                writRebate: true
+                writRebate: true,
+                aiAssessment: true,
+                cashSettlement: true
             }
         });
 
@@ -212,7 +251,7 @@ exports.getWritDetail = async (req, res) => {
         return res.status(200).json({ writ: log });
 
     } catch (error) {
-        console.error('AWAS V2 getWritDetail Fault:', error);
+        console.error('AWAS V3 getWritDetail Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -230,12 +269,13 @@ exports.getMyInvoices = async (req, res) => {
         return res.status(200).json({ count: invoices.length, invoices });
 
     } catch (error) {
-        console.error('AWAS V2 getMyInvoices Fault:', error);
+        console.error('AWAS V3 getMyInvoices Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
 
 // ─── CSV UPLOAD — HOC + OFFICER + BACKROOM ───────────────────────────────────
+// V3: onboarding fee now read from PricingConfig by vehicleType per row
 exports.uploadCsv = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -268,7 +308,9 @@ exports.uploadCsv = async (req, res) => {
         let successRows = 0;
         let failedRows = 0;
         const errors = [];
-        let newDriversCount = 0;
+
+        // Track new drivers per vehicleType for invoicing
+        const newDriversByType = { CAR: 0, MOTORCYCLE: 0, LORRY: 0, BUS: 0, VAN: 0 };
 
         for (const row of rows) {
             try {
@@ -276,6 +318,7 @@ exports.uploadCsv = async (req, res) => {
                 const policyNumber = (row['policynumber'] || '').toUpperCase().replace(/\s+/g, '');
                 const email = (row['email'] || '').toLowerCase().trim();
                 const policyExpiry = row['policyexpiry'];
+                const vehicleType = (row['vehicletype'] || 'CAR').toUpperCase();
 
                 if (!plate || !email || !policyNumber || !policyExpiry) {
                     failedRows++;
@@ -310,7 +353,7 @@ exports.uploadCsv = async (req, res) => {
                         insurerId,
                         vehiclePlate: plate,
                         vehicleMakeModel: row['vehiclemakemodel'] || 'Unknown',
-                        vehicleType: row['vehicletype'] || 'CAR',
+                        vehicleType: vehicleType,
                         mykadLastFour: row['mykadlastfour'] || '0000',
                         phone: row['phone'] || '',
                         email,
@@ -322,7 +365,12 @@ exports.uploadCsv = async (req, res) => {
                     }
                 });
 
-                newDriversCount++;
+                // Track new driver by type
+                if (newDriversByType.hasOwnProperty(vehicleType)) {
+                    newDriversByType[vehicleType]++;
+                } else {
+                    newDriversByType['CAR']++;
+                }
 
                 try {
                     await resend.emails.send({
@@ -334,7 +382,7 @@ exports.uploadCsv = async (req, res) => {
                             <h2 style="color:#0f172a;">Selamat Datang ke AWAS</h2>
                             <p>Akaun AWAS anda telah diaktifkan melalui polisi insurans <strong>${insurer.name}</strong>.</p>
                             <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                                <tr><td style="padding:8px;font-weight:700;color:#475569;">URL</td><td style="padding:8px;">${process.env.FE_URL}/insurer/login</td></tr>
+                                <tr><td style="padding:8px;font-weight:700;color:#475569;">URL</td><td style="padding:8px;">${process.env.FE_URL}/login</td></tr>
                                 <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Plat (Username)</td><td style="padding:8px;font-weight:800;">${plate}</td></tr>
                                 <tr><td style="padding:8px;font-weight:700;color:#475569;">Kata Laluan Sementara</td><td style="padding:8px;font-weight:800;color:#dc2626;">${tempPassword}</td></tr>
                             </table>
@@ -347,7 +395,7 @@ exports.uploadCsv = async (req, res) => {
                         `
                     });
                 } catch (emailErr) {
-                    console.error(`AWAS V2: Welcome email fault for ${plate}:`, emailErr);
+                    console.error(`AWAS V3: Welcome email fault for ${plate}:`, emailErr);
                 }
 
                 successRows++;
@@ -368,39 +416,46 @@ exports.uploadCsv = async (req, res) => {
             }
         });
 
-        // Auto-generate ONBOARDING invoice for new drivers
-        if (newDriversCount > 0) {
-            const invoiceNumber = await generateInvoiceNumber();
-            const unitFee = parseFloat(insurer.onboardingFee);
-            const totalAmount = unitFee * newDriversCount;
-            const now = new Date();
+        // ─── Generate ONBOARDING invoices per vehicleType from PricingConfig ──
+        for (const [vehicleType, count] of Object.entries(newDriversByType)) {
+            if (count === 0) continue;
+            try {
+                const unitFee = await getPricing('ONBOARDING_FEE', vehicleType);
+                const invoiceNumber = await generateInvoiceNumber();
+                const totalAmount = unitFee * count;
+                const now = new Date();
 
-            await prisma.invoice.create({
-                data: {
-                    invoiceNumber,
-                    insurerId,
-                    invoiceType: 'ONBOARDING',
-                    periodStart: now,
-                    periodEnd: now,
-                    totalUnits: newDriversCount,
-                    unitFee,
-                    totalAmount
-                }
-            });
+                await prisma.invoice.create({
+                    data: {
+                        invoiceNumber,
+                        insurerId,
+                        invoiceType: 'ONBOARDING',
+                        periodStart: now,
+                        periodEnd: now,
+                        totalUnits: count,
+                        unitFee,
+                        totalAmount
+                    }
+                });
 
-            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
+                console.log(`AWAS V3: Onboarding invoice ${invoiceNumber} — ${count} ${vehicleType} × RM${unitFee} = RM${totalAmount}`);
+            } catch (invErr) {
+                console.error(`AWAS V3: Onboarding invoice fault for ${vehicleType}:`, invErr.message);
+            }
         }
+
+        const totalNewDrivers = Object.values(newDriversByType).reduce((a, b) => a + b, 0);
 
         return res.status(200).json({
             message: `CSV diproses. ${successRows} berjaya, ${failedRows} gagal.`,
             successRows,
             failedRows,
-            newDriversCount,
+            newDriversCount: totalNewDrivers,
             errors: errors.length > 0 ? errors : undefined
         });
 
     } catch (error) {
-        console.error('AWAS V2 CSV Upload Fault:', error);
+        console.error('AWAS V3 CSV Upload Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -416,7 +471,7 @@ exports.getCsvUploads = async (req, res) => {
         });
         return res.status(200).json({ count: uploads.length, uploads });
     } catch (error) {
-        console.error('AWAS V2 getCsvUploads Fault:', error);
+        console.error('AWAS V3 getCsvUploads Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -424,14 +479,13 @@ exports.getCsvUploads = async (req, res) => {
 // ─── CREATE INSURER USER — HOC ONLY ──────────────────────────────────────────
 exports.createInsurerUser = async (req, res) => {
     try {
-        const { insurerId, role: creatorRole } = req.insurerUser;
+        const { insurerId } = req.insurerUser;
         const { name, email, role } = req.body;
 
         if (!name || !email || !role) {
             return res.status(400).json({ error: 'Nama, emel dan peranan diperlukan.' });
         }
 
-        // HOC cannot create another HOC
         if (role === 'HOC') {
             return res.status(403).json({ error: 'Anda tidak boleh mencipta akaun HOC.' });
         }
@@ -492,19 +546,17 @@ exports.createInsurerUser = async (req, res) => {
                 `
             });
         } catch (emailErr) {
-            console.error('AWAS V2: InsurerUser welcome email fault:', emailErr);
+            console.error('AWAS V3: InsurerUser welcome email fault:', emailErr);
         }
 
-        console.log(`AWAS V2: InsurerUser ${insurerUser.name} (${role}) created for insurer ${insurerId}`);
-
         return res.status(201).json({
-            message: `Pengguna ${name} (${role}) berjaya dicipta. Emel selamat datang telah dihantar.`,
+            message: `Pengguna ${name} (${role}) berjaya dicipta.`,
             userId: insurerUser.id,
             role: insurerUser.role
         });
 
     } catch (error) {
-        console.error('AWAS V2 createInsurerUser Fault:', error);
+        console.error('AWAS V3 createInsurerUser Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -531,7 +583,7 @@ exports.getInsurerUsers = async (req, res) => {
         return res.status(200).json({ count: users.length, users });
 
     } catch (error) {
-        console.error('AWAS V2 getInsurerUsers Fault:', error);
+        console.error('AWAS V3 getInsurerUsers Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -557,7 +609,207 @@ exports.toggleInsurerUserStatus = async (req, res) => {
         return res.status(200).json({ message: `${user.name} status dikemas kini kepada ${newStatus}.` });
 
     } catch (error) {
-        console.error('AWAS V2 toggleInsurerUserStatus Fault:', error);
+        console.error('AWAS V3 toggleInsurerUserStatus Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3: GET SETTLEMENTS — HOC ONLY ──────────────────────────────────────────
+// Lists all CashSettlement records for this insurer.
+// Filterable by status.
+exports.getSettlements = async (req, res) => {
+    try {
+        const { insurerId } = req.insurerUser;
+        const { status } = req.query;
+
+        const where = { insurerId };
+        if (status) where.status = status;
+
+        const settlements = await prisma.cashSettlement.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            include: {
+                accidentLog: {
+                    select: {
+                        writNumber: true,
+                        claimType: true,
+                        submittedAt: true,
+                        policeReportNumber: true,
+                        policeReportUploadedAt: true,
+                        driver: {
+                            select: {
+                                vehiclePlate: true,
+                                vehicleMakeModel: true,
+                                vehicleType: true,
+                                policyNumber: true,
+                                phone: true,
+                                email: true
+                            }
+                        },
+                        aiAssessment: {
+                            select: {
+                                status: true,
+                                totalEstimatedCost: true,
+                                overallSeverity: true,
+                                confidenceLevel: true,
+                                sentToInsurerAt: true
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        return res.status(200).json({ count: settlements.length, settlements });
+
+    } catch (error) {
+        console.error('AWAS V3 getSettlements Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3: GET SETTLEMENT DETAIL — HOC ONLY ────────────────────────────────────
+// Full detail including AI assessment JSON and all docs.
+exports.getSettlementDetail = async (req, res) => {
+    try {
+        const { insurerId } = req.insurerUser;
+        const { id } = req.params;
+
+        const settlement = await prisma.cashSettlement.findUnique({
+            where: { id: parseInt(id) },
+            include: {
+                accidentLog: {
+                    include: {
+                        driver: {
+                            select: {
+                                vehiclePlate: true,
+                                vehicleMakeModel: true,
+                                vehicleType: true,
+                                policyNumber: true,
+                                policyExpiry: true,
+                                phone: true,
+                                email: true
+                            }
+                        },
+                        aiAssessment: true,
+                        writRebate: true
+                    }
+                }
+            }
+        });
+
+        if (!settlement) return res.status(404).json({ error: 'Settlement tidak dijumpai.' });
+        if (settlement.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+
+        return res.status(200).json({ settlement });
+
+    } catch (error) {
+        console.error('AWAS V3 getSettlementDetail Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3: MAKE SETTLEMENT OFFER — HOC ONLY ────────────────────────────────────
+// HOC reviews AI assessment and makes cash offer to policyholder.
+// Creates OFFERED record. Notifies policyholder via email.
+// Offer expires in 7 days.
+exports.makeSettlementOffer = async (req, res) => {
+    try {
+        const { insurerId } = req.insurerUser;
+        const { id } = req.params;
+        const { offeredAmount } = req.body;
+
+        if (!offeredAmount || isNaN(parseFloat(offeredAmount)) || parseFloat(offeredAmount) <= 0) {
+            return res.status(400).json({ error: 'Jumlah tawaran tidak sah.' });
+        }
+
+        const settlement = await prisma.cashSettlement.findUnique({
+            where: { id: parseInt(id) },
+            include: {
+                accidentLog: {
+                    include: {
+                        driver: {
+                            select: {
+                                vehiclePlate: true,
+                                vehicleMakeModel: true,
+                                vehicleType: true,
+                                email: true,
+                                phone: true,
+                                policyNumber: true
+                            }
+                        },
+                        aiAssessment: {
+                            select: { totalEstimatedCost: true, overallSeverity: true }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (!settlement) return res.status(404).json({ error: 'Settlement tidak dijumpai.' });
+        if (settlement.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+        if (settlement.status !== 'PENDING') {
+            return res.status(409).json({ error: `Settlement sudah dalam status ${settlement.status}. Tawaran tidak boleh dibuat.` });
+        }
+
+        const now = new Date();
+        const offerExpiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+        await prisma.cashSettlement.update({
+            where: { id: parseInt(id) },
+            data: {
+                status: 'OFFERED',
+                offeredAmount: parseFloat(offeredAmount),
+                offeredAt: now,
+                offerExpiresAt
+            }
+        });
+
+        const driver = settlement.accidentLog.driver;
+        const writ = settlement.accidentLog;
+
+        // Notify policyholder via email
+        try {
+            await resend.emails.send({
+                from: 'AWAS <hello@awas.asia>',
+                to: driver.email,
+                subject: `[AWAS] Tawaran Penyelesaian Tunai — ${writ.writNumber}`,
+                html: `
+                    <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+                    <h2 style="color:#0f172a;">💰 Tawaran Penyelesaian Tunai AWAS</h2>
+                    <p>Syarikat insurans anda telah membuat tawaran penyelesaian tunai untuk tuntutan kemalangan anda.</p>
+                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Writ</td><td style="padding:8px;font-weight:800;">${writ.writNumber}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Kenderaan</td><td style="padding:8px;">${driver.vehicleMakeModel} (${driver.vehiclePlate})</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#47456;font-size:1.1rem;">Jumlah Tawaran</td><td style="padding:8px;font-weight:900;color:#16a34a;font-size:1.3rem;">RM ${parseFloat(offeredAmount).toFixed(2)}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tawaran Tamat</td><td style="padding:8px;color:#dc2626;">${offerExpiresAt.toLocaleDateString('ms-MY')}</td></tr>
+                    </table>
+                    <p>Jika anda <strong>terima</strong>, wang akan dibayar terus ke akaun bank anda. Anda boleh membuat pembaikan di mana-mana bengkel pilihan anda sebagai pelanggan tunai.</p>
+                    <p>Jika anda <strong>tolak</strong>, tuntutan akan diteruskan melalui saluran insurans biasa (Merimen).</p>
+                    <div style="margin:24px 0;display:flex;gap:12px;">
+                        <a href="${process.env.FE_URL}/settlement/${id}" style="background:#16a34a;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Lihat Tawaran</a>
+                    </div>
+                    <p style="font-size:0.75rem;color:#94a3b8;">Tawaran ini sah sehingga ${offerExpiresAt.toLocaleDateString('ms-MY')} sahaja.</p>
+                    </div>
+                `
+            });
+        } catch (emailErr) {
+            console.error('AWAS V3: Settlement offer email fault:', emailErr);
+        }
+
+        console.log(`AWAS V3: Settlement offer made — ID ${id} — RM${offeredAmount} — expires ${offerExpiresAt.toISOString()}`);
+
+        return res.status(200).json({
+            message: `Tawaran RM${parseFloat(offeredAmount).toFixed(2)} berjaya dihantar kepada ${driver.vehiclePlate}.`,
+            settlementId: parseInt(id),
+            offeredAmount: parseFloat(offeredAmount),
+            offeredAt: now,
+            offerExpiresAt,
+            status: 'OFFERED'
+        });
+
+    } catch (error) {
+        console.error('AWAS V3 makeSettlementOffer Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };

@@ -592,3 +592,115 @@ exports.getCsvUploads = async (req, res) => {
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
+
+// ─── V3: GET PRICING CONFIG ───────────────────────────────────────────────────
+// Returns all PricingConfig rows.
+// FE admin dashboard reads this to show current fee table.
+exports.getPricing = async (req, res) => {
+    try {
+        const configs = await prisma.pricingConfig.findMany({
+            orderBy: [{ key: 'asc' }, { vehicleType: 'asc' }]
+        });
+
+        return res.status(200).json({ count: configs.length, configs });
+
+    } catch (error) {
+        console.error('AWAS V3 getPricing Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3: SEED / UPDATE PRICING CONFIG ────────────────────────────────────────
+// Upserts all 6 standard pricing rows.
+// Body can pass individual overrides or use defaults.
+// Called once on first deploy, and whenever fees need updating.
+// Default fees:
+//   ONBOARDING_FEE: MOTORCYCLE=3, CAR=5
+//   WRIT_FEE:       MOTORCYCLE=6, CAR=10
+//   SETTLEMENT_FEE: MOTORCYCLE=60, CAR=100
+exports.updatePricing = async (req, res) => {
+    try {
+        const {
+            onboarding_motorcycle = 3.00,
+            onboarding_car = 5.00,
+            writ_motorcycle = 6.00,
+            writ_car = 10.00,
+            settlement_motorcycle = 60.00,
+            settlement_car = 100.00
+        } = req.body;
+
+        const configs = [
+            {
+                key: 'ONBOARDING_FEE',
+                vehicleType: 'MOTORCYCLE',
+                amount: parseFloat(onboarding_motorcycle),
+                description: 'Onboarding fee per motorcycle policyholder per year'
+            },
+            {
+                key: 'ONBOARDING_FEE',
+                vehicleType: 'CAR',
+                amount: parseFloat(onboarding_car),
+                description: 'Onboarding fee per car policyholder per year'
+            },
+            {
+                key: 'WRIT_FEE',
+                vehicleType: 'MOTORCYCLE',
+                amount: parseFloat(writ_motorcycle),
+                description: 'Writ submission fee per motorcycle claim'
+            },
+            {
+                key: 'WRIT_FEE',
+                vehicleType: 'CAR',
+                amount: parseFloat(writ_car),
+                description: 'Writ submission fee per car claim'
+            },
+            {
+                key: 'SETTLEMENT_FEE',
+                vehicleType: 'MOTORCYCLE',
+                amount: parseFloat(settlement_motorcycle),
+                description: 'Cash settlement facilitation fee per accepted motorcycle settlement'
+            },
+            {
+                key: 'SETTLEMENT_FEE',
+                vehicleType: 'CAR',
+                amount: parseFloat(settlement_car),
+                description: 'Cash settlement facilitation fee per accepted car settlement'
+            }
+        ];
+
+        const results = [];
+        for (const config of configs) {
+            const result = await prisma.pricingConfig.upsert({
+                where: {
+                    key_vehicleType: {
+                        key: config.key,
+                        vehicleType: config.vehicleType
+                    }
+                },
+                update: {
+                    amount: config.amount,
+                    description: config.description
+                },
+                create: {
+                    key: config.key,
+                    vehicleType: config.vehicleType,
+                    amount: config.amount,
+                    currency: 'MYR',
+                    description: config.description
+                }
+            });
+            results.push(result);
+        }
+
+        console.log(`AWAS V3: PricingConfig seeded/updated — ${results.length} rows`);
+
+        return res.status(200).json({
+            message: `${results.length} pricing configs updated.`,
+            configs: results
+        });
+
+    } catch (error) {
+        console.error('AWAS V3 updatePricing Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};

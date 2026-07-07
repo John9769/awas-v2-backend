@@ -30,4 +30,9 @@ router.post('/users', requireRole('HOC'), insurerController.createInsurerUser);
 router.get('/users', requireRole('HOC'), insurerController.getInsurerUsers);
 router.patch('/users/:id/toggle-status', requireRole('HOC'), insurerController.toggleInsurerUserStatus);
 
+// V3: Settlements — HOC only
+router.get('/settlements', requireRole('HOC'), insurerController.getSettlements);
+router.get('/settlements/:id', requireRole('HOC'), insurerController.getSettlementDetail);
+router.post('/settlements/:id/offer', requireRole('HOC'), insurerController.makeSettlementOffer);
+
 module.exports = router;

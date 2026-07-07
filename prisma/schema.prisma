@@ -64,6 +64,7 @@ enum RebateType {
 enum InvoiceType {
   ONBOARDING
   WRIT
+  SETTLEMENT
 }
 
 enum InsurerStatus {
@@ -83,6 +84,28 @@ enum InsurerUserStatus {
   SUSPENDED
 }
 
+// ─── V3 NEW ENUMS ─────────────────────────────────────────────────────────────
+
+enum PricingKey {
+  ONBOARDING_FEE
+  WRIT_FEE
+  SETTLEMENT_FEE
+}
+
+enum AiAssessmentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum SettlementStatus {
+  PENDING
+  OFFERED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
 // ─── INSURER ─────────────────────────────────────────────────────────────────
 model Insurer {
   id               Int               @id @default(autoincrement())
@@ -100,6 +123,7 @@ model Insurer {
   csvUploads       CsvUpload[]
   writRebates      WritRebate[]
   insurerUsers     InsurerUser[]
+  cashSettlements  CashSettlement[]
 
   @@map("insurers")
 }
@@ -149,34 +173,42 @@ model Driver {
 
 // ─── ACCIDENT LOG ─────────────────────────────────────────────────────────────
 model AccidentLog {
-  id                       Int              @id @default(autoincrement())
-  writNumber               String           @unique @map("writ_number")
-  logHash                  String           @unique @map("log_hash")
-  vehiclePlate             String           @map("vehicle_plate")
-  driver                   Driver           @relation(fields: [vehiclePlate], references: [vehiclePlate])
-  writStage                WritStage        @default(DRAFT) @map("writ_stage")
-  submittedAt              DateTime?        @map("submitted_at")
-  claimType                ClaimType?       @map("claim_type")
-  videoUrl                 String?          @map("video_url")
-  rawVideoUrl              String?          @map("raw_video_url")
-  videoHash                String?          @map("video_hash")
-  imageUrls                Json?            @map("image_urls")
-  imageHashes              Json?            @map("image_hashes")
-  audioUrl                 String?          @map("audio_url")
-  audioHash                String?          @map("audio_hash")
-  latitude                 Decimal          @db.Decimal(10,8)
-  longitude                Decimal          @db.Decimal(11,8)
-  incidentDescription      String?          @map("incident_description")
-  roadCondition            RoadCondition    @default(UNKNOWN) @map("road_condition")
-  weatherCondition         WeatherCondition @default(UNKNOWN) @map("weather_condition")
-  injuryStatus             InjuryStatus     @default(NONE) @map("injury_status")
-  otherVehiclePlate        String?          @map("other_vehicle_plate")
-  otherVehicleMakeModel    String?          @map("other_vehicle_make_model")
-  otherVehicleImageUrls    Json?            @map("other_vehicle_image_urls")
-  otherVehicleImageHashes  Json?            @map("other_vehicle_image_hashes")
-  videoSealedAt            DateTime?        @map("video_sealed_at")
-  createdAt                DateTime         @default(now()) @map("created_at")
+  id                       Int                @id @default(autoincrement())
+  writNumber               String             @unique @map("writ_number")
+  logHash                  String             @unique @map("log_hash")
+  vehiclePlate             String             @map("vehicle_plate")
+  driver                   Driver             @relation(fields: [vehiclePlate], references: [vehiclePlate])
+  writStage                WritStage          @default(DRAFT) @map("writ_stage")
+  submittedAt              DateTime?          @map("submitted_at")
+  claimType                ClaimType?         @map("claim_type")
+  videoUrl                 String?            @map("video_url")
+  rawVideoUrl              String?            @map("raw_video_url")
+  videoHash                String?            @map("video_hash")
+  imageUrls                Json?              @map("image_urls")
+  imageHashes              Json?              @map("image_hashes")
+  audioUrl                 String?            @map("audio_url")
+  audioHash                String?            @map("audio_hash")
+  latitude                 Decimal            @db.Decimal(10,8)
+  longitude                Decimal            @db.Decimal(11,8)
+  incidentDescription      String?            @map("incident_description")
+  roadCondition            RoadCondition      @default(UNKNOWN) @map("road_condition")
+  weatherCondition         WeatherCondition   @default(UNKNOWN) @map("weather_condition")
+  injuryStatus             InjuryStatus       @default(NONE) @map("injury_status")
+  otherVehiclePlate        String?            @map("other_vehicle_plate")
+  otherVehicleMakeModel    String?            @map("other_vehicle_make_model")
+  otherVehicleImageUrls    Json?              @map("other_vehicle_image_urls")
+  otherVehicleImageHashes  Json?              @map("other_vehicle_image_hashes")
+  videoSealedAt            DateTime?          @map("video_sealed_at")
+  createdAt                DateTime           @default(now()) @map("created_at")
+
+  // ─── V3 FIELDS ───────────────────────────────────────────────────────────
+  policeReportUrl          String?            @map("police_report_url")
+  policeReportNumber       String?            @map("police_report_number")
+  policeReportUploadedAt   DateTime?          @map("police_report_uploaded_at")
+
   writRebate               WritRebate?
+  aiAssessment             AiAssessment?
+  cashSettlement           CashSettlement?
 
   @@map("accident_logs")
 }
@@ -231,4 +263,90 @@ model CsvUpload {
   uploadedAt   DateTime @default(now()) @map("uploaded_at")
 
   @@map("csv_uploads")
+}
+
+// ─── V3: PRICING CONFIG ───────────────────────────────────────────────────────
+// Single source of truth for all fees.
+// Admin seeds this. Controllers READ from here — never hardcode fees.
+// One row per key+vehicleType combination.
+// ONBOARDING_FEE + MOTORCYCLE = RM3.00
+// ONBOARDING_FEE + CAR        = RM5.00
+// WRIT_FEE       + MOTORCYCLE = RM6.00
+// WRIT_FEE       + CAR        = RM10.00
+// SETTLEMENT_FEE + MOTORCYCLE = RM60.00
+// SETTLEMENT_FEE + CAR        = RM100.00
+model PricingConfig {
+  id          Int         @id @default(autoincrement())
+  key         PricingKey  @map("key")
+  vehicleType VehicleType @map("vehicle_type")
+  amount      Decimal     @db.Decimal(10,2)
+  currency    String      @default("MYR")
+  description String?
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  @@unique([key, vehicleType])
+  @@map("pricing_configs")
+}
+
+// ─── V3: AI ASSESSMENT ────────────────────────────────────────────────────────
+// Created SILENTLY after police report upload.
+// Policyholder NEVER sees this.
+// HOC portal sees full assessment alongside writ.
+// assessmentJson = full Claude Vision response (parts array, costs, notes)
+// sentToInsurerAt = timestamp when full package pushed to HOC portal
+model AiAssessment {
+  id                   Int                @id @default(autoincrement())
+  accidentLogId        Int                @unique @map("accident_log_id")
+  accidentLog          AccidentLog        @relation(fields: [accidentLogId], references: [id])
+  status               AiAssessmentStatus @default(PENDING)
+  assessmentJson       Json?              @map("assessment_json")
+  totalEstimatedCost   Decimal?           @db.Decimal(10,2) @map("total_estimated_cost")
+  overallSeverity      String?            @map("overall_severity")
+  confidenceLevel      String?            @map("confidence_level")
+  sentToInsurerAt      DateTime?          @map("sent_to_insurer_at")
+  failureReason        String?            @map("failure_reason")
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+
+  @@map("ai_assessments")
+}
+
+// ─── V3: CASH SETTLEMENT ──────────────────────────────────────────────────────
+// Created when HOC makes a cash settlement offer.
+// PENDING → OFFERED → ACCEPTED / REJECTED / EXPIRED
+// Sensitive docs stored ONLY after ACCEPTED (PDPA).
+// AWAS settlement fee billed ONLY when status = ACCEPTED.
+// If REJECTED — driver exits to Merimen. No fee charged.
+model CashSettlement {
+  id                     Int              @id @default(autoincrement())
+  accidentLogId          Int              @unique @map("accident_log_id")
+  accidentLog            AccidentLog      @relation(fields: [accidentLogId], references: [id])
+  insurerId              Int              @map("insurer_id")
+  insurer                Insurer          @relation(fields: [insurerId], references: [id])
+  status                 SettlementStatus @default(PENDING)
+  offeredAmount          Decimal?         @db.Decimal(10,2) @map("offered_amount")
+  offeredAt              DateTime?        @map("offered_at")
+  offerExpiresAt         DateTime?        @map("offer_expires_at")
+  policyholderDecidedAt  DateTime?        @map("policyholder_decided_at")
+
+  // ─── Docs collected ONLY after ACCEPTED (PDPA) ───────────────────────────
+  icUrl                  String?          @map("ic_url")
+  licenceUrl             String?          @map("licence_url")
+  vocUrl                 String?          @map("voc_url")
+  dischargeVoucherUrl    String?          @map("discharge_voucher_url")
+  bankAccountNumber      String?          @map("bank_account_number")
+  bankName               String?          @map("bank_name")
+  bankAccountName        String?          @map("bank_account_name")
+  docsSubmittedAt        DateTime?        @map("docs_submitted_at")
+
+  // ─── Billing ─────────────────────────────────────────────────────────────
+  settlementFee          Decimal?         @db.Decimal(10,2) @map("settlement_fee")
+  feeBilledAt            DateTime?        @map("fee_billed_at")
+  feeInvoiceNumber       String?          @map("fee_invoice_number")
+
+  createdAt              DateTime         @default(now()) @map("created_at")
+  updatedAt              DateTime         @updatedAt @map("updated_at")
+
+  @@map("cash_settlements")
 }
