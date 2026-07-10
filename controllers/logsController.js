@@ -1,10 +1,8 @@
 const { PrismaClient } = require('@prisma/client');
 const crypto = require('crypto');
 const cloudinary = require('cloudinary').v2;
-const { Resend } = require('resend');
 const Anthropic = require('@anthropic-ai/sdk');
 const prisma = new PrismaClient();
-const resend = new Resend(process.env.RESEND_API_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 cloudinary.config({
@@ -70,21 +68,47 @@ async function getPricing(key, vehicleType) {
     return parseFloat(config.amount);
 }
 
+// ─── HELPER: build a labeled image block for Claude Vision ───────────────────
+// FIX from audit: previously every image (own vehicle, other vehicle, police
+// report) was pushed into one flat array with no label, so Claude had no
+// signal distinguishing "photo to grade" from "document to verify". This is
+// what let the mismatched Kelisa test slip through as a confident RM82,850
+// estimate. Every image now gets an inline text label immediately before it.
+async function buildLabeledImageBlock(url, label) {
+    const base64 = await fetchImageAsBase64(url);
+    let mediaType = 'image/jpeg';
+    if (url.includes('.png')) mediaType = 'image/png';
+    else if (url.includes('.webp')) mediaType = 'image/webp';
+
+    return [
+        { type: 'text', text: label },
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } }
+    ];
+}
+
 // ─── INTERNAL: Run AI Assessment (SILENT — never expose to policyholder) ─────
-// Fires automatically after police report upload.
-// Sends all evidence images + police report to Claude Vision.
-// Result stored in AiAssessment table.
-// Full package (writ + AI assessment) pushed to insurer HOC portal.
+// Fires automatically after police report upload. Can also be re-triggered
+// manually via retryAssessment() below.
+// FIX: images are now labeled per-type so Claude can cross-check the
+// declared vehicle and the police report against what it actually sees,
+// instead of guessing from an unlabeled flat array.
+// FIX: no email notification on completion or failure — HOC/Executive/
+// Officer see everything live in the portal instead (confirmed today —
+// nobody reads insurer inbox emails fast enough for a claim workflow).
 async function runAiAssessment(accidentLogId) {
-    let assessment;
+    let assessment = await prisma.aiAssessment.findUnique({ where: { accidentLogId } });
+
     try {
-        // Create PENDING record immediately
-        assessment = await prisma.aiAssessment.create({
-            data: {
-                accidentLogId,
-                status: 'PENDING'
-            }
-        });
+        if (!assessment) {
+            assessment = await prisma.aiAssessment.create({
+                data: { accidentLogId, status: 'PENDING' }
+            });
+        } else {
+            assessment = await prisma.aiAssessment.update({
+                where: { accidentLogId },
+                data: { status: 'PENDING', failureReason: null }
+            });
+        }
 
         const log = await prisma.accidentLog.findUnique({
             where: { id: accidentLogId },
@@ -102,81 +126,90 @@ async function runAiAssessment(accidentLogId) {
 
         if (!log) throw new Error(`AccidentLog ${accidentLogId} not found`);
 
-        // Collect all image URLs for Claude Vision
-        const imageUrls = [];
+        // ─── Build labeled message content ───────────────────────────────────
+        const messageContent = [];
+        let imageCount = 0;
 
-        // Own vehicle images
         if (log.imageUrls && Array.isArray(log.imageUrls)) {
             for (const url of log.imageUrls) {
-                imageUrls.push(url);
+                try {
+                    imageCount++;
+                    const block = await buildLabeledImageBlock(
+                        url,
+                        `Own vehicle damage photo ${imageCount} — declared vehicle: ${log.driver.vehicleMakeModel} (${log.driver.vehiclePlate}). Assess damage AND verify this photo actually shows a vehicle matching the declared make/model.`
+                    );
+                    messageContent.push(...block);
+                } catch (imgErr) {
+                    console.error(`AWAS V3 AI: Failed to fetch own vehicle image ${url}:`, imgErr.message);
+                }
             }
         }
 
-        // Other vehicle images
         if (log.otherVehicleImageUrls && Array.isArray(log.otherVehicleImageUrls)) {
+            let otherCount = 0;
             for (const url of log.otherVehicleImageUrls) {
-                imageUrls.push(url);
+                try {
+                    otherCount++;
+                    const block = await buildLabeledImageBlock(
+                        url,
+                        `Other party's vehicle photo ${otherCount} — declared: ${log.otherVehicleMakeModel || 'not specified'} (${log.otherVehiclePlate || 'not specified'}). For context only, not part of this policyholder's repair estimate.`
+                    );
+                    messageContent.push(...block);
+                } catch (imgErr) {
+                    console.error(`AWAS V3 AI: Failed to fetch other vehicle image ${url}:`, imgErr.message);
+                }
             }
         }
 
-        // Police report image
         if (log.policeReportUrl) {
-            imageUrls.push(log.policeReportUrl);
-        }
-
-        if (imageUrls.length === 0) {
-            throw new Error('No images available for AI assessment');
-        }
-
-        // Build Claude Vision message — all images in ONE call
-        const messageContent = [];
-
-        for (const url of imageUrls) {
             try {
-                const base64 = await fetchImageAsBase64(url);
-                // Detect media type from URL
-                let mediaType = 'image/jpeg';
-                if (url.includes('.png')) mediaType = 'image/png';
-                else if (url.includes('.webp')) mediaType = 'image/webp';
-
-                messageContent.push({
-                    type: 'image',
-                    source: {
-                        type: 'base64',
-                        media_type: mediaType,
-                        data: base64
-                    }
-                });
+                const block = await buildLabeledImageBlock(
+                    log.policeReportUrl,
+                    `Police report document — READ this document. Extract the vehicle plate number(s) and incident narrative mentioned in it. This is a document to verify, NOT a damage photo to grade.`
+                );
+                messageContent.push(...block);
             } catch (imgErr) {
-                console.error(`AWAS V3 AI: Failed to fetch image ${url}:`, imgErr.message);
-                // Skip failed image — continue with rest
+                console.error(`AWAS V3 AI: Failed to fetch police report ${log.policeReportUrl}:`, imgErr.message);
             }
         }
 
-        if (messageContent.length === 0) {
-            throw new Error('All image fetches failed');
+        if (imageCount === 0) {
+            throw new Error('No own-vehicle images available for AI assessment');
         }
 
-        // Add assessment prompt
         messageContent.push({
             type: 'text',
-            text: `You are an expert Malaysian motor vehicle damage assessor. Analyse these accident photos and provide a detailed repair cost estimate.
+            text: `You are an expert Malaysian motor vehicle damage assessor AND a fraud verification checkpoint.
 
-Vehicle: ${log.driver.vehicleMakeModel} (${log.driver.vehiclePlate})
-Vehicle Type: ${log.driver.vehicleType}
-Claim Type: ${log.claimType}
-Road Condition: ${log.roadCondition}
-Weather: ${log.weatherCondition}
-Injury Status: ${log.injuryStatus}
+Declared claim details:
+- Vehicle: ${log.driver.vehicleMakeModel} (${log.driver.vehiclePlate})
+- Vehicle Type: ${log.driver.vehicleType}
+- Claim Type: ${log.claimType}
+- Road Condition: ${log.roadCondition}
+- Weather: ${log.weatherCondition}
+- Injury Status: ${log.injuryStatus}
+- Incident description (from driver): ${log.incidentDescription || 'not provided'}
+- Police report number (declared by driver): ${log.policeReportNumber || 'not provided'}
 
-Instructions:
-1. Identify ALL visibly damaged parts across ALL images provided. Do not duplicate parts.
+You have been given: own-vehicle damage photo(s), possibly other-party vehicle photo(s), and a police report document.
+
+STEP 1 — VERIFICATION (do this first, before estimating cost):
+1. Does the vehicle shown in the own-vehicle damage photo(s) visually match the declared make/model (${log.driver.vehicleMakeModel})? Set vehicleMatchVerified true/false.
+2. Does the police report document's content (plate number, incident narrative) correspond to this claim's declared vehicle and incident description? Set policeReportMatchVerified true/false.
+3. If EITHER check fails, or the police report describes a clearly different incident/vehicle than what's declared, set fraudFlagged true and explain why in fraudReason. If both checks pass, fraudFlagged should be false and fraudReason null.
+
+STEP 2 — DAMAGE ASSESSMENT (always do this regardless of Step 1 outcome — HOC needs to see the estimate either way):
+1. Identify ALL visibly damaged parts across the own-vehicle photos. Do not duplicate parts.
 2. Estimate repair/replacement cost for each part in Malaysian Ringgit (MYR) based on current Malaysian workshop rates.
 3. Consolidate parts seen from multiple angles — list each part ONCE only.
 4. Be conservative and realistic. Use genuine parts pricing for Malaysian market.
 
 Respond ONLY in this exact JSON format, no preamble, no markdown:
 {
+  "vehicleMatchVerified": true,
+  "policeReportMatchVerified": true,
+  "fraudFlagged": false,
+  "fraudReason": null,
   "parts": [
     {
       "part": "Part name in English",
@@ -193,7 +226,7 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
 }`
         });
 
-        console.log(`AWAS V3 AI: Sending ${messageContent.length - 1} images to Claude Vision for log ${accidentLogId}`);
+        console.log(`AWAS V3 AI: Sending ${imageCount + (log.otherVehicleImageUrls?.length || 0) + (log.policeReportUrl ? 1 : 0)} labeled images to Claude Vision for log ${accidentLogId}`);
 
         const response = await anthropic.messages.create({
             model: 'claude-opus-4-6',
@@ -203,7 +236,6 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
 
         const rawText = response.content[0].text.trim();
 
-        // Parse JSON response
         let assessmentData;
         try {
             const clean = rawText.replace(/```json|```/g, '').trim();
@@ -212,7 +244,8 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
             throw new Error(`Claude Vision response parse failed: ${rawText.substring(0, 200)}`);
         }
 
-        // Update AiAssessment to COMPLETED
+        const fraudFlagged = assessmentData.fraudFlagged === true;
+
         await prisma.aiAssessment.update({
             where: { id: assessment.id },
             data: {
@@ -221,11 +254,25 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
                 totalEstimatedCost: assessmentData.totalEstimatedCostMYR || 0,
                 overallSeverity: assessmentData.overallSeverity || 'UNKNOWN',
                 confidenceLevel: assessmentData.confidenceLevel || 'LOW',
+                vehicleMatchVerified: assessmentData.vehicleMatchVerified ?? null,
+                policeReportMatchVerified: assessmentData.policeReportMatchVerified ?? null,
+                fraudFlagged,
+                fraudReason: assessmentData.fraudReason || null,
                 sentToInsurerAt: new Date()
             }
         });
 
-        // Create CashSettlement record (PENDING — awaiting HOC offer)
+        // WritRebate only becomes eligible if the claim passed fraud checks.
+        // Previously this fired unconditionally at submission — now it's
+        // gated on a genuinely verified, non-fraud-flagged assessment.
+        await prisma.writRebate.updateMany({
+            where: { accidentLogId },
+            data: { isEligible: !fraudFlagged }
+        });
+
+        // Create CashSettlement PENDING record — HOC decides later whether
+        // it's actually eligible for a cash offer based on SettlementFeeTier
+        // (checked at offer-time in insurerController, not here).
         const existingSettlement = await prisma.cashSettlement.findUnique({
             where: { accidentLogId }
         });
@@ -240,42 +287,12 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
             });
         }
 
-        // Notify insurer HOC via email — full package ready for review
-        try {
-            await resend.emails.send({
-                from: 'AWAS <hello@awas.asia>',
-                to: log.driver.insurer.email,
-                subject: `[AWAS] Writ Baru + AI Assessment Sedia — ${log.writNumber}`,
-                html: `
-                    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">🔍 Writ + AI Assessment Sedia untuk Semakan</h2>
-                    <p>Writ kemalangan berikut telah lengkap dengan laporan polis dan AI assessment. Sedia untuk keputusan penyelesaian.</p>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Writ</td><td style="padding:8px;font-weight:800;color:#dc2626;">${log.writNumber}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Kenderaan</td><td style="padding:8px;">${log.driver.vehicleMakeModel} (${log.driver.vehiclePlate})</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jenis Tuntutan</td><td style="padding:8px;">${log.claimType}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Anggaran Kos Kerosakan</td><td style="padding:8px;font-weight:800;color:#dc2626;">RM ${assessmentData.totalEstimatedCostMYR?.toFixed(2)}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tahap Kerosakan</td><td style="padding:8px;">${assessmentData.overallSeverity}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Keyakinan AI</td><td style="padding:8px;">${assessmentData.confidenceLevel}</td></tr>
-                    </table>
-                    <p style="font-size:0.8rem;color:#94a3b8;font-style:italic;">${assessmentData.disclaimer}</p>
-                    <div style="margin:24px 0;">
-                        <a href="${process.env.FE_URL}/insurer/settlements" style="background:#0f1623;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Buka Portal HOC</a>
-                    </div>
-                    </div>
-                `
-            });
-        } catch (emailErr) {
-            console.error('AWAS V3 AI: HOC notification email fault:', emailErr);
-        }
-
-        console.log(`AWAS V3 AI: Assessment COMPLETED for log ${accidentLogId} — RM${assessmentData.totalEstimatedCostMYR} / ${assessmentData.overallSeverity}`);
+        console.log(`AWAS V3 AI: Assessment COMPLETED for log ${accidentLogId} — RM${assessmentData.totalEstimatedCostMYR} / ${assessmentData.overallSeverity} / fraudFlagged=${fraudFlagged}`);
         return assessment;
 
     } catch (error) {
         console.error(`AWAS V3 AI: Assessment FAILED for log ${accidentLogId}:`, error.message);
 
-        // Update to FAILED — do not crash the police report upload
         if (assessment) {
             await prisma.aiAssessment.update({
                 where: { id: assessment.id },
@@ -285,11 +302,15 @@ Respond ONLY in this exact JSON format, no preamble, no markdown:
                 }
             }).catch(e => console.error('AWAS V3 AI: Failed to update FAILED status:', e));
         }
+        throw error;
     }
 }
 
 // ─── SUBMIT WRIT ──────────────────────────────────────────────────────────────
-// V3: writ fee now read from PricingConfig by vehicleType
+// CHANGED: writ fee is NO LONGER billed here. It bills at police report
+// upload instead (see uploadPoliceReport below) — confirmed today, since
+// billing at submission meant insurers could be charged for writs that are
+// later abandoned before a police report ever gets uploaded.
 exports.submitWrit = async (req, res) => {
     try {
         const { vehiclePlate } = req.driver;
@@ -328,7 +349,6 @@ exports.submitWrit = async (req, res) => {
 
         console.log(`AWAS V3: submitWrit called for ${vehiclePlate} — claimType: ${claimType}`);
 
-        // ─── Video ────────────────────────────────────────────────────────────
         const videoBuffer = req.files['video'][0].buffer;
         const videoHash = computeSHA256FromBuffer(videoBuffer);
 
@@ -339,7 +359,6 @@ exports.submitWrit = async (req, res) => {
         });
         const rawVideoUrl = videoUpload.secure_url;
 
-        // ─── Own vehicle images ───────────────────────────────────────────────
         const imageUrls = [];
         const imageHashes = [];
 
@@ -357,7 +376,6 @@ exports.submitWrit = async (req, res) => {
             }
         }
 
-        // ─── Audio ────────────────────────────────────────────────────────────
         let audioUrl = null;
         let audioHash = null;
 
@@ -372,7 +390,6 @@ exports.submitWrit = async (req, res) => {
             audioUrl = audioUpload.secure_url;
         }
 
-        // ─── Other vehicle images ─────────────────────────────────────────────
         const otherVehicleImageUrls = [];
         const otherVehicleImageHashes = [];
 
@@ -390,7 +407,6 @@ exports.submitWrit = async (req, res) => {
             }
         }
 
-        // ─── Master logHash ───────────────────────────────────────────────────
         const submittedAt = new Date().toISOString();
         const logContent = [
             vehiclePlate,
@@ -406,7 +422,6 @@ exports.submitWrit = async (req, res) => {
 
         const writNumber = await generateWritNumber();
 
-        // ─── Save AccidentLog ─────────────────────────────────────────────────
         const log = await prisma.accidentLog.create({
             data: {
                 writNumber,
@@ -438,7 +453,9 @@ exports.submitWrit = async (req, res) => {
 
         console.log(`AWAS V3: Writ SUBMITTED — ${writNumber} for ${vehiclePlate}`);
 
-        // ─── WritRebate ───────────────────────────────────────────────────────
+        // WritRebate row created now, but isEligible defaults to false —
+        // it only flips true once AiAssessment completes without fraud
+        // flags (see runAiAssessment above).
         const rebateType = claimType === 'OWN_DAMAGE' ? 'PERCENTAGE' : 'FLAT';
         const rebateValue = claimType === 'OWN_DAMAGE' ? 10.00 : 30.00;
 
@@ -450,57 +467,13 @@ exports.submitWrit = async (req, res) => {
                 claimType,
                 rebateType,
                 rebateValue,
+                isEligible: false,
                 isApplied: false
             }
         });
 
-        // ─── WRIT invoice — read fee from PricingConfig ───────────────────────
-        try {
-            const invoiceNumber = await generateInvoiceNumber();
-            const unitFee = await getPricing('WRIT_FEE', driver.vehicleType);
-            const now = new Date();
-
-            await prisma.invoice.create({
-                data: {
-                    invoiceNumber,
-                    insurerId: driver.insurerId,
-                    invoiceType: 'WRIT',
-                    periodStart: now,
-                    periodEnd: now,
-                    totalUnits: 1,
-                    unitFee,
-                    totalAmount: unitFee
-                }
-            });
-
-            console.log(`AWAS V3: Writ invoice ${invoiceNumber} — RM${unitFee} billed to insurer`);
-        } catch (invoiceErr) {
-            console.error('AWAS V3: Writ invoice generation fault:', invoiceErr);
-        }
-
-        // ─── Notify driver ────────────────────────────────────────────────────
-        try {
-            await resend.emails.send({
-                from: 'AWAS <hello@awas.asia>',
-                to: driver.email,
-                subject: `[AWAS] Writ Disubmit — ${writNumber}`,
-                html: `
-                    <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">✅ Writ Forensik AWAS Disubmit</h2>
-                    <p>Writ kemalangan anda telah berjaya disubmit.</p>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Writ</td><td style="padding:8px;font-weight:800;color:#dc2626;">${writNumber}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Plat Kenderaan</td><td style="padding:8px;">${vehiclePlate}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jenis Tuntutan</td><td style="padding:8px;">${claimType === 'OWN_DAMAGE' ? 'Kerosakan Sendiri' : 'Pihak Ketiga'}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tandatangan Master</td><td style="padding:8px;font-family:monospace;font-size:0.75rem;word-break:break-all;">${logHash}</td></tr>
-                    </table>
-                    <p style="color:#f59e0b;font-weight:700;">⚠️ Langkah seterusnya: Sila upload laporan polis dalam masa 24 jam untuk meneruskan tuntutan.</p>
-                    </div>
-                `
-            });
-        } catch (emailErr) {
-            console.error('AWAS V3: Writ email fault:', emailErr);
-        }
+        // NOTE: writ fee invoice REMOVED from here — now bills at
+        // uploadPoliceReport instead. See below.
 
         return res.status(201).json({
             message: 'Writ berjaya disubmit. Sila upload laporan polis untuk meneruskan tuntutan.',
@@ -520,11 +493,9 @@ exports.submitWrit = async (req, res) => {
 };
 
 // ─── UPLOAD POLICE REPORT ─────────────────────────────────────────────────────
-// V3 NEW. Driver uploads police report after writ submission.
-// MANDATORY before any claim proceeds.
-// After successful upload → triggers runAiAssessment() SILENTLY (fire-and-forget).
-// Driver is NOT informed AI assessment is running.
-// Response to driver is immediate — AI runs in background.
+// CHANGED: writ fee now bills HERE, at police report upload — the point
+// where a writ becomes a real, verifiable claim, not just an app open.
+// AI assessment still fires silently in the background as before.
 exports.uploadPoliceReport = async (req, res) => {
     try {
         const { vehiclePlate } = req.driver;
@@ -540,7 +511,6 @@ exports.uploadPoliceReport = async (req, res) => {
             return res.status(400).json({ error: 'Fail laporan polis diperlukan.' });
         }
 
-        // Normalize writ number
         const parts = writNumber.split('-');
         const normalized = parts.length === 4
             ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
@@ -549,7 +519,7 @@ exports.uploadPoliceReport = async (req, res) => {
         const log = await prisma.accidentLog.findUnique({
             where: { writNumber: normalized },
             include: {
-                driver: { select: { vehiclePlate: true, insurerId: true } }
+                driver: { select: { vehiclePlate: true, vehicleType: true, insurerId: true, insurer: { select: { name: true } } } }
             }
         });
 
@@ -558,7 +528,6 @@ exports.uploadPoliceReport = async (req, res) => {
         if (log.writStage !== 'SUBMITTED') return res.status(400).json({ error: 'Writ belum disubmit.' });
         if (log.policeReportUrl) return res.status(409).json({ error: 'Laporan polis sudah diupload untuk writ ini.' });
 
-        // Upload police report to Cloudinary
         const reportBuffer = req.files['policeReport'][0].buffer;
         const reportUpload = await uploadToCloudinary(reportBuffer, {
             resource_type: 'image',
@@ -568,7 +537,6 @@ exports.uploadPoliceReport = async (req, res) => {
 
         const now = new Date();
 
-        // Save to AccidentLog
         await prisma.accidentLog.update({
             where: { id: log.id },
             data: {
@@ -580,12 +548,38 @@ exports.uploadPoliceReport = async (req, res) => {
 
         console.log(`AWAS V3: Police report uploaded for writ ${normalized} — Report No: ${policeReportNumber}`);
 
+        // ─── Bill writ fee NOW — genuine, verifiable claim ────────────────────
+        try {
+            const unitFee = await getPricing('WRIT_FEE', log.driver.vehicleType);
+            const invoiceNumber = await generateInvoiceNumber();
+
+            await prisma.invoice.create({
+                data: {
+                    invoiceNumber,
+                    insurerId: log.driver.insurerId,
+                    invoiceType: 'WRIT',
+                    periodStart: now,
+                    periodEnd: now,
+                    totalUnits: 1,
+                    unitFee,
+                    totalAmount: unitFee
+                }
+            });
+
+            await prisma.accidentLog.update({
+                where: { id: log.id },
+                data: { writFeeBilledAt: now, writFeeInvoiceNumber: invoiceNumber }
+            });
+
+            console.log(`AWAS V3: Writ invoice ${invoiceNumber} — RM${unitFee} billed to insurer at police report upload`);
+        } catch (invoiceErr) {
+            console.error('AWAS V3: Writ invoice generation fault:', invoiceErr);
+        }
+
         // ─── FIRE AI ASSESSMENT SILENTLY ──────────────────────────────────────
-        // Do NOT await — response goes back to driver immediately.
-        // AI runs in background. Driver never sees this happening.
         setImmediate(() => {
             runAiAssessment(log.id).catch(err => {
-                console.error(`AWAS V3: Silent AI assessment fault for log ${log.id}:`, err);
+                console.error(`AWAS V3: Silent AI assessment fault for log ${log.id}:`, err.message);
             });
         });
 
@@ -599,6 +593,159 @@ exports.uploadPoliceReport = async (req, res) => {
     } catch (error) {
         console.error('AWAS V3 uploadPoliceReport Fault:', error);
         return res.status(500).json({ error: 'Ralat semasa mengupload laporan polis.' });
+    }
+};
+
+// ─── RETRY ASSESSMENT — HOC / EXECUTIVE / OFFICER ────────────────────────────
+// NEW. Manual retry for a FAILED assessment. Unlike the silent background
+// trigger, this is an explicit action — awaited, so the caller gets the
+// real result back instead of a fire-and-forget response.
+exports.retryAssessment = async (req, res) => {
+    try {
+        const { insurerId } = req.insurerUser;
+        const { writNumber } = req.params;
+
+        const parts = writNumber.split('-');
+        const normalized = parts.length === 4
+            ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
+            : writNumber;
+
+        const log = await prisma.accidentLog.findUnique({
+            where: { writNumber: normalized },
+            include: { driver: { select: { insurerId: true } }, aiAssessment: true }
+        });
+
+        if (!log) return res.status(404).json({ error: 'Writ tidak dijumpai.' });
+        if (log.driver.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+        if (!log.policeReportUrl) return res.status(400).json({ error: 'Laporan polis belum diupload lagi.' });
+        if (log.aiAssessment && log.aiAssessment.status === 'COMPLETED') {
+            return res.status(409).json({ error: 'Assessment sudah lengkap. Retry tidak diperlukan.' });
+        }
+
+        console.log(`AWAS V3: Manual retry assessment triggered for ${normalized} by insurerUser ${req.insurerUser.id}`);
+
+        await runAiAssessment(log.id);
+
+        const updated = await prisma.aiAssessment.findUnique({ where: { accidentLogId: log.id } });
+
+        return res.status(200).json({
+            message: updated.status === 'COMPLETED' ? 'Assessment berjaya dijana semula.' : 'Assessment masih gagal.',
+            assessment: updated
+        });
+
+    } catch (error) {
+        console.error('AWAS V3 retryAssessment Fault:', error);
+        return res.status(500).json({ error: 'Ralat semasa cuba semula assessment.' });
+    }
+};
+
+// ─── ESCALATE TO MANUAL — HOC / EXECUTIVE / OFFICER ──────────────────────────
+// NEW. All evidence (video/images/police report) is already fully uploaded —
+// nothing is re-collected from the driver. This just assigns the writ to a
+// specific subordinate for hands-on review instead of relying on AI.
+exports.escalateToManual = async (req, res) => {
+    try {
+        const { insurerId, id: escalatedByUserId } = req.insurerUser;
+        const { writNumber } = req.params;
+        const { assignedToUserId, escalationNotes } = req.body;
+
+        if (!assignedToUserId) return res.status(400).json({ error: 'assignedToUserId diperlukan.' });
+
+        const assignee = await prisma.insurerUser.findUnique({ where: { id: parseInt(assignedToUserId) } });
+        if (!assignee || assignee.insurerId !== insurerId) {
+            return res.status(404).json({ error: 'Pengguna yang ditugaskan tidak dijumpai.' });
+        }
+        if (assignee.role === 'CLERICAL') {
+            return res.status(400).json({ error: 'Clerical tidak boleh ditugaskan untuk siasatan tuntutan.' });
+        }
+
+        const parts = writNumber.split('-');
+        const normalized = parts.length === 4
+            ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
+            : writNumber;
+
+        const log = await prisma.accidentLog.findUnique({
+            where: { writNumber: normalized },
+            include: { driver: { select: { insurerId: true } }, aiAssessment: true }
+        });
+
+        if (!log) return res.status(404).json({ error: 'Writ tidak dijumpai.' });
+        if (log.driver.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+        if (!log.aiAssessment) return res.status(400).json({ error: 'Tiada AI assessment untuk writ ini lagi.' });
+
+        const updated = await prisma.aiAssessment.update({
+            where: { accidentLogId: log.id },
+            data: {
+                escalatedToManual: true,
+                escalatedByUserId,
+                assignedToUserId: parseInt(assignedToUserId),
+                escalatedAt: new Date(),
+                escalationNotes: escalationNotes || null,
+                resolvedByUserId: null,
+                resolvedAt: null,
+                resolutionNotes: null
+            }
+        });
+
+        console.log(`AWAS V3: Writ ${normalized} escalated to manual — assigned to insurerUser ${assignedToUserId}`);
+
+        return res.status(200).json({
+            message: `Tuntutan ditugaskan kepada ${assignee.name} untuk siasatan manual.`,
+            assessment: updated
+        });
+
+    } catch (error) {
+        console.error('AWAS V3 escalateToManual Fault:', error);
+        return res.status(500).json({ error: 'Ralat semasa menugaskan siasatan manual.' });
+    }
+};
+
+// ─── RESOLVE ESCALATION — assigned user, or HOC ──────────────────────────────
+// NEW. Closes the loop once the subordinate finishes their manual review.
+exports.resolveEscalation = async (req, res) => {
+    try {
+        const { insurerId, id: userId, role } = req.insurerUser;
+        const { writNumber } = req.params;
+        const { resolutionNotes } = req.body;
+
+        const parts = writNumber.split('-');
+        const normalized = parts.length === 4
+            ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
+            : writNumber;
+
+        const log = await prisma.accidentLog.findUnique({
+            where: { writNumber: normalized },
+            include: { driver: { select: { insurerId: true } }, aiAssessment: true }
+        });
+
+        if (!log) return res.status(404).json({ error: 'Writ tidak dijumpai.' });
+        if (log.driver.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
+        if (!log.aiAssessment || !log.aiAssessment.escalatedToManual) {
+            return res.status(400).json({ error: 'Tuntutan ini tidak dalam status ditugaskan.' });
+        }
+        if (log.aiAssessment.assignedToUserId !== userId && role !== 'HOC') {
+            return res.status(403).json({ error: 'Hanya pengguna yang ditugaskan atau HOC boleh menyelesaikan siasatan ini.' });
+        }
+
+        const updated = await prisma.aiAssessment.update({
+            where: { accidentLogId: log.id },
+            data: {
+                resolvedByUserId: userId,
+                resolvedAt: new Date(),
+                resolutionNotes: resolutionNotes || null
+            }
+        });
+
+        console.log(`AWAS V3: Escalation resolved for writ ${normalized} by insurerUser ${userId}`);
+
+        return res.status(200).json({
+            message: 'Siasatan manual ditandakan selesai.',
+            assessment: updated
+        });
+
+    } catch (error) {
+        console.error('AWAS V3 resolveEscalation Fault:', error);
+        return res.status(500).json({ error: 'Ralat semasa menyelesaikan siasatan.' });
     }
 };
 
@@ -652,6 +799,8 @@ exports.getMyWrits = async (req, res) => {
 };
 
 // ─── GET WRIT BY NUMBER ───────────────────────────────────────────────────────
+// Public — police-facing verification page. Deliberately excludes
+// aiAssessment and cashSettlement — policyholder/public must NOT see AI data.
 exports.getWritByNumber = async (req, res) => {
     try {
         const { writNumber } = req.params;
@@ -673,8 +822,6 @@ exports.getWritByNumber = async (req, res) => {
                     }
                 },
                 writRebate: true
-                // NOTE: aiAssessment and cashSettlement deliberately excluded here
-                // This is the public-facing endpoint — policyholder must NOT see AI data
             }
         });
 

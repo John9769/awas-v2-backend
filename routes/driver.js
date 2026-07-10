@@ -17,4 +17,8 @@ router.post('/settlement/:settlementId/accept', driverController.acceptSettlemen
 router.post('/settlement/:settlementId/reject', driverController.rejectSettlementOffer);
 router.post('/settlement/:settlementId/docs', uploadSettlementDocs, driverController.uploadSettlementDocs);
 
+// NEW: in-app notifications
+router.get('/notifications', driverController.getNotifications);
+router.patch('/notifications/:id/read', driverController.markNotificationRead);
+
 module.exports = router;

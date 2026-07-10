@@ -35,6 +35,28 @@ async function getPricing(key, vehicleType) {
     return parseFloat(config.amount);
 }
 
+// ─── HELPER: Find matching SettlementFeeTier for a claim amount ──────────────
+// FIXED: replaces the old getPricing('SETTLEMENT_FEE', vehicleType) call —
+// that PricingKey no longer exists in the schema (settlement fees moved to
+// tiered bands to avoid a percentage-of-AI's-own-estimate conflict of
+// interest). This mirrors the identical helper in insurerController so both
+// files agree on which tier/fee applies to a given claim.
+async function findSettlementTier(vehicleType, claimAmount) {
+    const tiers = await prisma.settlementFeeTier.findMany({
+        where: { vehicleType },
+        orderBy: { minAmount: 'asc' }
+    });
+
+    for (const tier of tiers) {
+        const min = parseFloat(tier.minAmount);
+        const max = tier.maxAmount !== null ? parseFloat(tier.maxAmount) : null;
+        if (claimAmount >= min && (max === null || claimAmount < max)) {
+            return tier;
+        }
+    }
+    return null;
+}
+
 // ─── GET PROFILE ──────────────────────────────────────────────────────────────
 exports.getProfile = async (req, res) => {
     try {
@@ -278,7 +300,9 @@ exports.rejectSettlementOffer = async (req, res) => {
 // Called ONLY after driver ACCEPTS offer.
 // Collects: IC copy, driving licence, VOC, discharge voucher, bank details.
 // PDPA: sensitive docs collected here ONLY — never before acceptance.
-// After docs submitted → bills insurer settlement fee from PricingConfig.
+// FIXED: settlement fee now comes from SettlementFeeTier (tiered bands
+// based on AI's estimated claim amount), not the deleted flat
+// PricingConfig SETTLEMENT_FEE row.
 exports.uploadSettlementDocs = async (req, res) => {
     try {
         const { vehiclePlate } = req.driver;
@@ -301,7 +325,8 @@ exports.uploadSettlementDocs = async (req, res) => {
                                 insurerId: true,
                                 insurer: { select: { id: true, name: true } }
                             }
-                        }
+                        },
+                        aiAssessment: { select: { totalEstimatedCost: true } }
                     }
                 }
             }
@@ -342,12 +367,21 @@ exports.uploadSettlementDocs = async (req, res) => {
         const now = new Date();
         const driver = settlement.accidentLog.driver;
         const vehicleType = driver.vehicleType;
+        const estimatedCost = settlement.accidentLog.aiAssessment?.totalEstimatedCost
+            ? parseFloat(settlement.accidentLog.aiAssessment.totalEstimatedCost)
+            : null;
 
-        // Get settlement fee from PricingConfig
         let settlementFee = 0;
         let invoiceNumber = null;
         try {
-            settlementFee = await getPricing('SETTLEMENT_FEE', vehicleType);
+            if (estimatedCost === null) throw new Error('No AI assessment total found — cannot determine settlement fee tier');
+
+            const tier = await findSettlementTier(vehicleType, estimatedCost);
+            if (!tier || !tier.isEligibleForCashSettlement || tier.fee === null) {
+                throw new Error(`No eligible settlement fee tier for ${vehicleType} at RM${estimatedCost}`);
+            }
+
+            settlementFee = parseFloat(tier.fee);
             invoiceNumber = await generateInvoiceNumber();
 
             await prisma.invoice.create({
@@ -363,10 +397,12 @@ exports.uploadSettlementDocs = async (req, res) => {
                 }
             });
 
-            console.log(`AWAS V3: Settlement invoice ${invoiceNumber} — RM${settlementFee} billed to insurer ${driver.insurer.name}`);
+            console.log(`AWAS V3: Settlement invoice ${invoiceNumber} — RM${settlementFee} (tier-based) billed to insurer ${driver.insurer.name}`);
         } catch (feeErr) {
             console.error('AWAS V3: Settlement fee billing fault:', feeErr.message);
-            // Non-fatal — docs still saved
+            // Non-fatal — docs still saved even if fee billing fails; shouldn't
+            // normally trigger since makeSettlementOffer already validated
+            // tier eligibility before the offer was ever made.
         }
 
         // Save docs + billing info
@@ -400,5 +436,60 @@ exports.uploadSettlementDocs = async (req, res) => {
     } catch (error) {
         console.error('AWAS V3 uploadSettlementDocs Fault:', error);
         return res.status(500).json({ error: 'Ralat semasa mengupload dokumen.' });
+    }
+};
+
+// ─── V3 NEW: GET NOTIFICATIONS — driver ──────────────────────────────────────
+// In-app notifications, primary channel (email is backup, sent in parallel
+// by insurerController's makeSettlementOffer). Scoped narrow — settlement
+// offers only, per today's decision to not flood the app with every event.
+exports.getNotifications = async (req, res) => {
+    try {
+        const { vehiclePlate } = req.driver;
+
+        const driver = await prisma.driver.findUnique({ where: { vehiclePlate }, select: { id: true } });
+        if (!driver) return res.status(404).json({ error: 'Akaun tidak dijumpai.' });
+
+        const notifications = await prisma.driverNotification.findMany({
+            where: { driverId: driver.id },
+            orderBy: { createdAt: 'desc' },
+            take: 50
+        });
+
+        const unreadCount = await prisma.driverNotification.count({
+            where: { driverId: driver.id, isRead: false }
+        });
+
+        return res.status(200).json({ count: notifications.length, unreadCount, notifications });
+
+    } catch (error) {
+        console.error('AWAS V3 getNotifications Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3 NEW: MARK NOTIFICATION READ — driver ─────────────────────────────────
+exports.markNotificationRead = async (req, res) => {
+    try {
+        const { vehiclePlate } = req.driver;
+        const { id } = req.params;
+
+        const driver = await prisma.driver.findUnique({ where: { vehiclePlate }, select: { id: true } });
+        if (!driver) return res.status(404).json({ error: 'Akaun tidak dijumpai.' });
+
+        const notification = await prisma.driverNotification.findUnique({ where: { id: parseInt(id) } });
+        if (!notification) return res.status(404).json({ error: 'Notifikasi tidak dijumpai.' });
+        if (notification.driverId !== driver.id) return res.status(403).json({ error: 'Akses ditolak.' });
+
+        await prisma.driverNotification.update({
+            where: { id: parseInt(id) },
+            data: { isRead: true, readAt: new Date() }
+        });
+
+        return res.status(200).json({ message: 'Notifikasi ditanda sebagai dibaca.' });
+
+    } catch (error) {
+        console.error('AWAS V3 markNotificationRead Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };

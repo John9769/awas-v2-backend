@@ -17,6 +17,15 @@ async function generateInvoiceNumber() {
     return `AWAS-INV-${year}-${String(count + 1).padStart(4, '0')}`;
 }
 
+// ─── HELPER: Get pricing from DB ─────────────────────────────────────────────
+async function getPricing(key, vehicleType) {
+    const config = await prisma.pricingConfig.findUnique({
+        where: { key_vehicleType: { key, vehicleType } }
+    });
+    if (!config) throw new Error(`PricingConfig missing: ${key} / ${vehicleType}`);
+    return parseFloat(config.amount);
+}
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 exports.getDashboard = async (req, res) => {
     try {
@@ -63,15 +72,18 @@ exports.getDashboard = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('AWAS V2 Admin Dashboard Fault:', error);
+        console.error('AWAS V3 Admin Dashboard Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
 
 // ─── CREATE INSURER ───────────────────────────────────────────────────────────
+// FIXED: no longer sets onboardingFee/writFee — those columns are gone.
+// Rates come exclusively from PricingConfig (global default) now.
+// NEW: cashRebateEnabled can be set at creation time (defaults false).
 exports.createInsurer = async (req, res) => {
     try {
-        const { name, code, email, contactPerson, phone, onboardingFee, writFee } = req.body;
+        const { name, code, email, contactPerson, phone, cashRebateEnabled } = req.body;
 
         if (!name || !code || !email || !contactPerson || !phone) {
             return res.status(400).json({ error: 'Semua medan wajib diperlukan.' });
@@ -91,12 +103,11 @@ exports.createInsurer = async (req, res) => {
                 email: email.toLowerCase(),
                 contactPerson,
                 phone,
-                onboardingFee: onboardingFee || 40.00,
-                writFee: writFee || 9.90
+                cashRebateEnabled: cashRebateEnabled === true
             }
         });
 
-        console.log(`AWAS V2: Insurer ${insurer.name} created.`);
+        console.log(`AWAS V3: Insurer ${insurer.name} created. Rebate enabled: ${insurer.cashRebateEnabled}`);
 
         return res.status(201).json({
             message: `Insurans ${insurer.name} berjaya dicipta. Sila cipta pengguna HOC untuk insurans ini.`,
@@ -105,7 +116,31 @@ exports.createInsurer = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('AWAS V2 Create Insurer Fault:', error);
+        console.error('AWAS V3 Create Insurer Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── TOGGLE CASH REBATE — ADMIN ONLY ─────────────────────────────────────────
+// NEW. Lets admin flip an insurer's rebate opt-in without recreating the
+// insurer. Confirmed: this is the insurer's own choice, not forced by AWAS.
+exports.toggleCashRebate = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(id) } });
+        if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
+
+        const updated = await prisma.insurer.update({
+            where: { id: parseInt(id) },
+            data: { cashRebateEnabled: !insurer.cashRebateEnabled }
+        });
+
+        return res.status(200).json({
+            message: `${insurer.name} cash rebate ${updated.cashRebateEnabled ? 'diaktifkan' : 'dinyahaktifkan'}.`,
+            cashRebateEnabled: updated.cashRebateEnabled
+        });
+    } catch (error) {
+        console.error('AWAS V3 toggleCashRebate Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -127,7 +162,6 @@ exports.createHocUser = async (req, res) => {
         });
         if (existing) return res.status(409).json({ error: 'Emel sudah digunakan.' });
 
-        // Check if HOC already exists for this insurer
         const existingHoc = await prisma.insurerUser.findFirst({
             where: { insurerId: parseInt(insurerId), role: 'HOC' }
         });
@@ -165,19 +199,18 @@ exports.createHocUser = async (req, res) => {
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Kata Laluan Sementara</td><td style="padding:8px;font-weight:800;color:#dc2626;">${tempPassword}</td></tr>
                     </table>
                     <p style="color:#dc2626;font-weight:700;">Sila tukar kata laluan anda selepas log masuk pertama.</p>
-                    <p>Sebagai HOC, anda boleh mencipta pengguna lain (Officer, Backroom, Accounts) dari dalam portal.</p>
+                    <p>Sebagai HOC, anda boleh mencipta pengguna lain (Executive, Officer, Clerical) dari dalam portal.</p>
                     <div style="margin:24px 0;">
                         <a href="${process.env.FE_URL}/insurer/login" style="background:#0f1623;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Log Masuk Portal</a>
                     </div>
-                    <p style="font-size:0.75rem;color:#94a3b8;">Kadar Onboarding: RM${parseFloat(insurer.onboardingFee).toFixed(2)}/polisi | Kadar Writ: RM${parseFloat(insurer.writFee).toFixed(2)}/writ</p>
                     </div>
                 `
             });
         } catch (emailErr) {
-            console.error('AWAS V2: HOC welcome email fault:', emailErr);
+            console.error('AWAS V3: HOC welcome email fault:', emailErr);
         }
 
-        console.log(`AWAS V2: HOC user ${hocUser.name} created for insurer ${insurer.name}`);
+        console.log(`AWAS V3: HOC user ${hocUser.name} created for insurer ${insurer.name}`);
 
         return res.status(201).json({
             message: `HOC ${name} berjaya dicipta untuk ${insurer.name}. Emel selamat datang telah dihantar.`,
@@ -186,7 +219,7 @@ exports.createHocUser = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('AWAS V2 Create HOC User Fault:', error);
+        console.error('AWAS V3 Create HOC User Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -199,7 +232,7 @@ exports.getInsurers = async (req, res) => {
             select: {
                 id: true, name: true, code: true, email: true,
                 contactPerson: true, phone: true, status: true,
-                onboardingFee: true, writFee: true,
+                cashRebateEnabled: true, ownDamageRebatePercent: true, thirdPartyRebateFlat: true,
                 createdAt: true,
                 _count: { select: { drivers: true, invoices: true, insurerUsers: true } }
             }
@@ -249,6 +282,11 @@ exports.toggleInsurerStatus = async (req, res) => {
 };
 
 // ─── CSV UPLOAD — ADMIN ───────────────────────────────────────────────────────
+// FIXED (real bug #1): vehicleType now uppercased, same as insurerController's
+// version. FIXED (real bug #2): onboarding invoice now reads from
+// PricingConfig per vehicleType instead of the deleted insurer.onboardingFee
+// flat column — this admin path and the insurer-portal path now bill
+// identically, closing the "two billing sources" bug for good.
 exports.uploadCsv = async (req, res) => {
     try {
         const { insurerId } = req.body;
@@ -282,7 +320,7 @@ exports.uploadCsv = async (req, res) => {
         let successRows = 0;
         let failedRows = 0;
         const errors = [];
-        let newDriversCount = 0;
+        const newDriversByType = { CAR: 0, MOTORCYCLE: 0, LORRY: 0, BUS: 0, VAN: 0 };
 
         for (const row of rows) {
             try {
@@ -290,6 +328,7 @@ exports.uploadCsv = async (req, res) => {
                 const policyNumber = (row['policynumber'] || '').toUpperCase().replace(/\s+/g, '');
                 const email = (row['email'] || '').toLowerCase().trim();
                 const policyExpiry = row['policyexpiry'];
+                const vehicleType = (row['vehicletype'] || 'CAR').toUpperCase(); // FIXED: was missing .toUpperCase()
 
                 if (!plate || !email || !policyNumber || !policyExpiry) {
                     failedRows++;
@@ -318,7 +357,7 @@ exports.uploadCsv = async (req, res) => {
                         insurerId: parseInt(insurerId),
                         vehiclePlate: plate,
                         vehicleMakeModel: row['vehiclemakemodel'] || 'Unknown',
-                        vehicleType: row['vehicletype'] || 'CAR',
+                        vehicleType,
                         mykadLastFour: row['mykadlastfour'] || '0000',
                         phone: row['phone'] || '',
                         email,
@@ -330,7 +369,11 @@ exports.uploadCsv = async (req, res) => {
                     }
                 });
 
-                newDriversCount++;
+                if (newDriversByType.hasOwnProperty(vehicleType)) {
+                    newDriversByType[vehicleType]++;
+                } else {
+                    newDriversByType['CAR']++;
+                }
 
                 try {
                     await resend.emails.send({
@@ -355,7 +398,7 @@ exports.uploadCsv = async (req, res) => {
                         `
                     });
                 } catch (emailErr) {
-                    console.error(`AWAS V2: Welcome email fault for ${plate}:`, emailErr);
+                    console.error(`AWAS V3: Welcome email fault for ${plate}:`, emailErr);
                 }
 
                 successRows++;
@@ -376,27 +419,36 @@ exports.uploadCsv = async (req, res) => {
             }
         });
 
-        if (newDriversCount > 0) {
-            const invoiceNumber = await generateInvoiceNumber();
-            const unitFee = parseFloat(insurer.onboardingFee);
-            const totalAmount = unitFee * newDriversCount;
-            const now = new Date();
+        // FIXED: bills per vehicleType from PricingConfig — same logic as
+        // insurerController.uploadCsv now, no more divergent billing source.
+        for (const [vehicleType, count] of Object.entries(newDriversByType)) {
+            if (count === 0) continue;
+            try {
+                const unitFee = await getPricing('ONBOARDING_FEE', vehicleType);
+                const invoiceNumber = await generateInvoiceNumber();
+                const totalAmount = unitFee * count;
+                const now = new Date();
 
-            await prisma.invoice.create({
-                data: {
-                    invoiceNumber,
-                    insurerId: parseInt(insurerId),
-                    invoiceType: 'ONBOARDING',
-                    periodStart: now,
-                    periodEnd: now,
-                    totalUnits: newDriversCount,
-                    unitFee,
-                    totalAmount
-                }
-            });
+                await prisma.invoice.create({
+                    data: {
+                        invoiceNumber,
+                        insurerId: parseInt(insurerId),
+                        invoiceType: 'ONBOARDING',
+                        periodStart: now,
+                        periodEnd: now,
+                        totalUnits: count,
+                        unitFee,
+                        totalAmount
+                    }
+                });
 
-            console.log(`AWAS V2: Onboarding invoice ${invoiceNumber} — ${newDriversCount} new drivers × RM${unitFee} = RM${totalAmount}`);
+                console.log(`AWAS V3: Onboarding invoice ${invoiceNumber} — ${count} ${vehicleType} × RM${unitFee} = RM${totalAmount}`);
+            } catch (invErr) {
+                console.error(`AWAS V3: Onboarding invoice fault for ${vehicleType}:`, invErr.message);
+            }
         }
+
+        const newDriversCount = Object.values(newDriversByType).reduce((a, b) => a + b, 0);
 
         return res.status(200).json({
             message: `CSV diproses. ${successRows} berjaya, ${failedRows} gagal.`,
@@ -407,7 +459,7 @@ exports.uploadCsv = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('AWAS V2 CSV Upload Fault:', error);
+        console.error('AWAS V3 CSV Upload Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -448,7 +500,11 @@ exports.getWrits = async (req, res) => {
                 latitude: true, longitude: true, claimType: true,
                 roadCondition: true, weatherCondition: true, injuryStatus: true,
                 submittedAt: true, createdAt: true,
-                driver: { select: { insurer: { select: { name: true, code: true } } } }
+                writFeeBilledAt: true, writFeeInvoiceNumber: true,
+                driver: { select: { insurer: { select: { name: true, code: true } } } },
+                aiAssessment: {
+                    select: { status: true, fraudFlagged: true, escalatedToManual: true }
+                }
             }
         });
         return res.status(200).json({ count: writs.length, writs });
@@ -468,92 +524,6 @@ exports.getInvoices = async (req, res) => {
         });
         return res.status(200).json({ count: invoices.length, invoices });
     } catch (error) {
-        return res.status(500).json({ error: 'Ralat pelayan.' });
-    }
-};
-
-// ─── GENERATE WRIT INVOICE ────────────────────────────────────────────────────
-exports.generateWritInvoice = async (req, res) => {
-    try {
-        const { insurerId, periodStart, periodEnd } = req.body;
-
-        if (!insurerId || !periodStart || !periodEnd) {
-            return res.status(400).json({ error: 'insurerId, periodStart dan periodEnd diperlukan.' });
-        }
-
-        const insurer = await prisma.insurer.findUnique({ where: { id: parseInt(insurerId) } });
-        if (!insurer) return res.status(404).json({ error: 'Insurans tidak dijumpai.' });
-
-        const submittedWrits = await prisma.accidentLog.count({
-            where: {
-                driver: { insurerId: parseInt(insurerId) },
-                writStage: 'SUBMITTED',
-                submittedAt: {
-                    gte: new Date(periodStart),
-                    lte: new Date(periodEnd)
-                }
-            }
-        });
-
-        if (submittedWrits === 0) {
-            return res.status(400).json({ error: 'Tiada writ submitted dalam tempoh ini.' });
-        }
-
-        const unitFee = parseFloat(insurer.writFee);
-        const totalAmount = unitFee * submittedWrits;
-        const invoiceNumber = await generateInvoiceNumber();
-
-        await prisma.invoice.create({
-            data: {
-                invoiceNumber,
-                insurerId: parseInt(insurerId),
-                invoiceType: 'WRIT',
-                periodStart: new Date(periodStart),
-                periodEnd: new Date(periodEnd),
-                totalUnits: submittedWrits,
-                unitFee,
-                totalAmount
-            }
-        });
-
-        try {
-            await resend.emails.send({
-                from: 'AWAS <hello@awas.asia>',
-                to: insurer.email,
-                subject: `[AWAS] Invois Writ ${invoiceNumber}`,
-                html: `
-                    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">Invois Writ AWAS</h2>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Invois</td><td style="padding:8px;font-weight:800;">${invoiceNumber}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Syarikat</td><td style="padding:8px;">${insurer.name}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jenis Invois</td><td style="padding:8px;">Writ Forensik</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Tempoh</td><td style="padding:8px;">${new Date(periodStart).toLocaleDateString('ms-MY')} — ${new Date(periodEnd).toLocaleDateString('ms-MY')}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Jumlah Writ Submitted</td><td style="padding:8px;">${submittedWrits}</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#475569;">Kadar Per Writ</td><td style="padding:8px;">RM${unitFee.toFixed(2)}</td></tr>
-                        <tr style="background:#f0fdf4;"><td style="padding:12px;font-weight:800;font-size:1.1rem;">JUMLAH PERLU DIBAYAR</td><td style="padding:12px;font-weight:800;font-size:1.1rem;color:#16a34a;">RM${totalAmount.toFixed(2)}</td></tr>
-                    </table>
-                    <p>Sila buat pembayaran kepada:</p>
-                    <table style="width:100%;border-collapse:collapse;margin:16px 0;background:#f8fafc;">
-                        <tr><td style="padding:8px;font-weight:700;">Nama Syarikat</td><td style="padding:8px;">AWAS Premium Resources</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;">No. SSM</td><td style="padding:8px;">202603141446</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;">Emel</td><td style="padding:8px;">hello@awas.asia</td></tr>
-                    </table>
-                    <p style="font-size:0.8rem;color:#64748b;">Invois ini dijana secara automatik oleh sistem AWAS.</p>
-                    </div>
-                `
-            });
-        } catch (emailErr) {
-            console.error('AWAS V2: Writ invoice email fault:', emailErr);
-        }
-
-        return res.status(201).json({
-            message: `Invois writ ${invoiceNumber} berjaya dijana.`,
-            invoice: { invoiceNumber, invoiceType: 'WRIT', submittedWrits, unitFee, totalAmount, periodStart, periodEnd }
-        });
-
-    } catch (error) {
-        console.error('AWAS V2 Generate Writ Invoice Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
@@ -594,16 +564,12 @@ exports.getCsvUploads = async (req, res) => {
 };
 
 // ─── V3: GET PRICING CONFIG ───────────────────────────────────────────────────
-// Returns all PricingConfig rows.
-// FE admin dashboard reads this to show current fee table.
 exports.getPricing = async (req, res) => {
     try {
         const configs = await prisma.pricingConfig.findMany({
             orderBy: [{ key: 'asc' }, { vehicleType: 'asc' }]
         });
-
         return res.status(200).json({ count: configs.length, configs });
-
     } catch (error) {
         console.error('AWAS V3 getPricing Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
@@ -611,96 +577,117 @@ exports.getPricing = async (req, res) => {
 };
 
 // ─── V3: SEED / UPDATE PRICING CONFIG ────────────────────────────────────────
-// Upserts all 6 standard pricing rows.
-// Body can pass individual overrides or use defaults.
-// Called once on first deploy, and whenever fees need updating.
-// Default fees:
-//   ONBOARDING_FEE: MOTORCYCLE=3, CAR=5
-//   WRIT_FEE:       MOTORCYCLE=6, CAR=10
-//   SETTLEMENT_FEE: MOTORCYCLE=60, CAR=100
+// FIXED: SETTLEMENT_FEE removed from here entirely — that enum value no
+// longer exists in PricingKey. Only ONBOARDING_FEE and WRIT_FEE remain.
 exports.updatePricing = async (req, res) => {
     try {
         const {
             onboarding_motorcycle = 3.00,
             onboarding_car = 5.00,
             writ_motorcycle = 6.00,
-            writ_car = 10.00,
-            settlement_motorcycle = 60.00,
-            settlement_car = 100.00
+            writ_car = 10.00
         } = req.body;
 
         const configs = [
-            {
-                key: 'ONBOARDING_FEE',
-                vehicleType: 'MOTORCYCLE',
-                amount: parseFloat(onboarding_motorcycle),
-                description: 'Onboarding fee per motorcycle policyholder per year'
-            },
-            {
-                key: 'ONBOARDING_FEE',
-                vehicleType: 'CAR',
-                amount: parseFloat(onboarding_car),
-                description: 'Onboarding fee per car policyholder per year'
-            },
-            {
-                key: 'WRIT_FEE',
-                vehicleType: 'MOTORCYCLE',
-                amount: parseFloat(writ_motorcycle),
-                description: 'Writ submission fee per motorcycle claim'
-            },
-            {
-                key: 'WRIT_FEE',
-                vehicleType: 'CAR',
-                amount: parseFloat(writ_car),
-                description: 'Writ submission fee per car claim'
-            },
-            {
-                key: 'SETTLEMENT_FEE',
-                vehicleType: 'MOTORCYCLE',
-                amount: parseFloat(settlement_motorcycle),
-                description: 'Cash settlement facilitation fee per accepted motorcycle settlement'
-            },
-            {
-                key: 'SETTLEMENT_FEE',
-                vehicleType: 'CAR',
-                amount: parseFloat(settlement_car),
-                description: 'Cash settlement facilitation fee per accepted car settlement'
-            }
+            { key: 'ONBOARDING_FEE', vehicleType: 'MOTORCYCLE', amount: parseFloat(onboarding_motorcycle), description: 'Onboarding fee per motorcycle policyholder per year' },
+            { key: 'ONBOARDING_FEE', vehicleType: 'CAR', amount: parseFloat(onboarding_car), description: 'Onboarding fee per car policyholder per year' },
+            { key: 'WRIT_FEE', vehicleType: 'MOTORCYCLE', amount: parseFloat(writ_motorcycle), description: 'Writ submission fee per motorcycle claim, billed at police report upload' },
+            { key: 'WRIT_FEE', vehicleType: 'CAR', amount: parseFloat(writ_car), description: 'Writ submission fee per car claim, billed at police report upload' }
         ];
 
         const results = [];
         for (const config of configs) {
             const result = await prisma.pricingConfig.upsert({
-                where: {
-                    key_vehicleType: {
-                        key: config.key,
-                        vehicleType: config.vehicleType
-                    }
-                },
-                update: {
-                    amount: config.amount,
-                    description: config.description
-                },
-                create: {
-                    key: config.key,
-                    vehicleType: config.vehicleType,
-                    amount: config.amount,
-                    currency: 'MYR',
-                    description: config.description
-                }
+                where: { key_vehicleType: { key: config.key, vehicleType: config.vehicleType } },
+                update: { amount: config.amount, description: config.description },
+                create: { key: config.key, vehicleType: config.vehicleType, amount: config.amount, currency: 'MYR', description: config.description }
             });
             results.push(result);
         }
 
         console.log(`AWAS V3: PricingConfig seeded/updated — ${results.length} rows`);
 
-        return res.status(200).json({
-            message: `${results.length} pricing configs updated.`,
-            configs: results
-        });
+        return res.status(200).json({ message: `${results.length} pricing configs updated.`, configs: results });
 
     } catch (error) {
         console.error('AWAS V3 updatePricing Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
+
+// ─── V3 NEW: GET SETTLEMENT FEE TIERS ────────────────────────────────────────
+exports.getSettlementFeeTiers = async (req, res) => {
+    try {
+        const tiers = await prisma.settlementFeeTier.findMany({
+            orderBy: [{ vehicleType: 'asc' }, { minAmount: 'asc' }]
+        });
+        return res.status(200).json({ count: tiers.length, tiers });
+    } catch (error) {
+        console.error('AWAS V3 getSettlementFeeTiers Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan.' });
+    }
+};
+
+// ─── V3 NEW: SEED / UPDATE SETTLEMENT FEE TIERS ──────────────────────────────
+// Replaces the old flat RM60/RM100 SETTLEMENT_FEE. Accepts a full array of
+// tier rows so you can define exact bands + the claim-value ceiling per
+// vehicleType. Wipes and re-inserts per vehicleType to avoid orphaned
+// overlapping bands from partial updates — this table changes shape more
+// than PricingConfig does (bands can be added/removed, not just amounts).
+//
+// Expected body shape:
+// {
+//   "tiers": [
+//     { "vehicleType": "CAR", "minAmount": 0, "maxAmount": 5000, "fee": 100, "isEligibleForCashSettlement": true },
+//     { "vehicleType": "CAR", "minAmount": 5000, "maxAmount": 20000, "fee": 150, "isEligibleForCashSettlement": true },
+//     { "vehicleType": "CAR", "minAmount": 20000, "maxAmount": null, "fee": null, "isEligibleForCashSettlement": false },
+//     { "vehicleType": "MOTORCYCLE", "minAmount": 0, "maxAmount": 3000, "fee": 60, "isEligibleForCashSettlement": true },
+//     { "vehicleType": "MOTORCYCLE", "minAmount": 3000, "maxAmount": null, "fee": null, "isEligibleForCashSettlement": false }
+//   ]
+// }
+exports.updateSettlementFeeTiers = async (req, res) => {
+    try {
+        const { tiers } = req.body;
+
+        if (!Array.isArray(tiers) || tiers.length === 0) {
+            return res.status(400).json({ error: 'tiers array diperlukan.' });
+        }
+
+        const affectedVehicleTypes = [...new Set(tiers.map(t => t.vehicleType))];
+
+        const result = await prisma.$transaction(async (tx) => {
+            await tx.settlementFeeTier.deleteMany({
+                where: { vehicleType: { in: affectedVehicleTypes } }
+            });
+
+            const created = [];
+            for (const tier of tiers) {
+                if (!tier.vehicleType || tier.minAmount === undefined) {
+                    throw new Error('Setiap tier perlu ada vehicleType dan minAmount.');
+                }
+                const row = await tx.settlementFeeTier.create({
+                    data: {
+                        vehicleType: tier.vehicleType,
+                        minAmount: parseFloat(tier.minAmount),
+                        maxAmount: tier.maxAmount !== null && tier.maxAmount !== undefined ? parseFloat(tier.maxAmount) : null,
+                        fee: tier.fee !== null && tier.fee !== undefined ? parseFloat(tier.fee) : null,
+                        isEligibleForCashSettlement: tier.isEligibleForCashSettlement !== false,
+                        description: tier.description || null
+                    }
+                });
+                created.push(row);
+            }
+            return created;
+        });
+
+        console.log(`AWAS V3: SettlementFeeTier updated — ${result.length} rows across ${affectedVehicleTypes.join(', ')}`);
+
+        return res.status(200).json({ message: `${result.length} settlement fee tiers updated.`, tiers: result });
+
+    } catch (error) {
+        console.error('AWAS V3 updateSettlementFeeTiers Fault:', error);
+        return res.status(500).json({ error: 'Ralat pelayan: ' + error.message });
+    }
+};
+
+module.exports = exports;

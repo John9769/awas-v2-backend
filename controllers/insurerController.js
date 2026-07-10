@@ -26,6 +26,27 @@ async function getPricing(key, vehicleType) {
     return parseFloat(config.amount);
 }
 
+// ─── HELPER: Find matching SettlementFeeTier for a claim amount ──────────────
+// NEW. Given a vehicleType and a claim amount, finds the tier band it falls
+// into. Returns null if no matching tier exists (misconfigured — treat as
+// not eligible, don't guess). This is the enforcement point for the
+// claim-value ceiling agreed today.
+async function findSettlementTier(vehicleType, claimAmount) {
+    const tiers = await prisma.settlementFeeTier.findMany({
+        where: { vehicleType },
+        orderBy: { minAmount: 'asc' }
+    });
+
+    for (const tier of tiers) {
+        const min = parseFloat(tier.minAmount);
+        const max = tier.maxAmount !== null ? parseFloat(tier.maxAmount) : null;
+        if (claimAmount >= min && (max === null || claimAmount < max)) {
+            return tier;
+        }
+    }
+    return null;
+}
+
 // ─── GET INSURER DASHBOARD — HOC ONLY ────────────────────────────────────────
 exports.getDashboard = async (req, res) => {
     try {
@@ -45,7 +66,9 @@ exports.getDashboard = async (req, res) => {
             unpaidInvoices,
             totalUsers,
             pendingSettlements,
-            acceptedSettlements
+            acceptedSettlements,
+            fraudFlaggedCount,
+            escalatedCount
         ] = await Promise.all([
             prisma.driver.count({ where: { insurerId } }),
             prisma.driver.count({ where: { insurerId, status: 'ACTIVE' } }),
@@ -53,38 +76,24 @@ exports.getDashboard = async (req, res) => {
                 where: {
                     insurerId,
                     status: 'ACTIVE',
-                    policyExpiry: {
-                        gte: today,
-                        lte: new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000)
-                    }
+                    policyExpiry: { gte: today, lte: new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000) }
                 }
             }),
-            prisma.accidentLog.count({
-                where: { driver: { insurerId }, writStage: 'SUBMITTED' }
-            }),
-            prisma.accidentLog.count({
-                where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: today } }
-            }),
-            prisma.accidentLog.count({
-                where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: thisMonth } }
-            }),
+            prisma.accidentLog.count({ where: { driver: { insurerId }, writStage: 'SUBMITTED' } }),
+            prisma.accidentLog.count({ where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: today } } }),
+            prisma.accidentLog.count({ where: { driver: { insurerId }, writStage: 'SUBMITTED', submittedAt: { gte: thisMonth } } }),
             prisma.invoice.count({ where: { insurerId, isPaid: false } }),
             prisma.insurerUser.count({ where: { insurerId } }),
-            // V3: settlements awaiting HOC decision
             prisma.cashSettlement.count({ where: { insurerId, status: 'PENDING' } }),
-            // V3: accepted settlements this month
-            prisma.cashSettlement.count({
-                where: {
-                    insurerId,
-                    status: 'ACCEPTED',
-                    policyholderDecidedAt: { gte: thisMonth }
-                }
-            })
+            prisma.cashSettlement.count({ where: { insurerId, status: 'ACCEPTED', policyholderDecidedAt: { gte: thisMonth } } }),
+            // NEW: visibility on fraud flags and open escalations right on the dashboard
+            prisma.aiAssessment.count({ where: { accidentLog: { driver: { insurerId } }, fraudFlagged: true } }),
+            prisma.aiAssessment.count({ where: { accidentLog: { driver: { insurerId } }, escalatedToManual: true, resolvedAt: null } })
         ]);
 
         const insurer = await prisma.insurer.findUnique({
             where: { id: insurerId },
-            select: { name: true, code: true, email: true, onboardingFee: true, writFee: true }
+            select: { name: true, code: true, email: true, cashRebateEnabled: true }
         });
 
         return res.status(200).json({
@@ -98,6 +107,8 @@ exports.getDashboard = async (req, res) => {
             totalUsers,
             pendingSettlements,
             acceptedSettlements,
+            fraudFlaggedCount,
+            openEscalations: escalatedCount,
             insurer,
             insurerUser: req.insurerUser
         });
@@ -108,7 +119,7 @@ exports.getDashboard = async (req, res) => {
     }
 };
 
-// ─── GET MY POLICYHOLDERS — HOC + OFFICER ────────────────────────────────────
+// ─── GET MY POLICYHOLDERS — HOC + EXECUTIVE + OFFICER ────────────────────────
 exports.getMyDrivers = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -128,16 +139,9 @@ exports.getMyDrivers = async (req, res) => {
             where,
             orderBy: { createdAt: 'desc' },
             select: {
-                id: true,
-                vehiclePlate: true,
-                vehicleMakeModel: true,
-                vehicleType: true,
-                phone: true,
-                email: true,
-                policyNumber: true,
-                policyExpiry: true,
-                status: true,
-                createdAt: true,
+                id: true, vehiclePlate: true, vehicleMakeModel: true, vehicleType: true,
+                phone: true, email: true, policyNumber: true, policyExpiry: true,
+                status: true, createdAt: true,
                 _count: { select: { accidentLogs: true } }
             }
         });
@@ -150,20 +154,16 @@ exports.getMyDrivers = async (req, res) => {
     }
 };
 
-// ─── GET MY WRITS — HOC + OFFICER ────────────────────────────────────────────
+// ─── GET MY WRITS — HOC + EXECUTIVE + OFFICER ────────────────────────────────
 exports.getMyWrits = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
         const { vehiclePlate, dateFrom, dateTo, claimType } = req.query;
 
-        const where = {
-            driver: { insurerId },
-            writStage: 'SUBMITTED'
-        };
+        const where = { driver: { insurerId }, writStage: 'SUBMITTED' };
 
         if (vehiclePlate) where.vehiclePlate = vehiclePlate.toUpperCase();
         if (claimType) where.claimType = claimType;
-
         if (dateFrom || dateTo) {
             where.submittedAt = {};
             if (dateFrom) where.submittedAt.gte = new Date(dateFrom);
@@ -175,31 +175,17 @@ exports.getMyWrits = async (req, res) => {
             orderBy: { submittedAt: 'desc' },
             include: {
                 driver: {
-                    select: {
-                        vehiclePlate: true,
-                        vehicleMakeModel: true,
-                        vehicleType: true,
-                        policyNumber: true,
-                        phone: true,
-                        email: true
-                    }
+                    select: { vehiclePlate: true, vehicleMakeModel: true, vehicleType: true, policyNumber: true, phone: true, email: true }
                 },
                 aiAssessment: {
                     select: {
-                        status: true,
-                        totalEstimatedCost: true,
-                        overallSeverity: true,
-                        confidenceLevel: true,
-                        sentToInsurerAt: true
+                        status: true, totalEstimatedCost: true, overallSeverity: true, confidenceLevel: true,
+                        fraudFlagged: true, fraudReason: true,
+                        escalatedToManual: true, assignedToUserId: true, resolvedAt: true,
+                        sentToInsurerAt: true, failureReason: true
                     }
                 },
-                cashSettlement: {
-                    select: {
-                        status: true,
-                        offeredAmount: true,
-                        offeredAt: true
-                    }
-                }
+                cashSettlement: { select: { status: true, offeredAmount: true, offeredAt: true } }
             }
         });
 
@@ -211,32 +197,20 @@ exports.getMyWrits = async (req, res) => {
     }
 };
 
-// ─── GET SINGLE WRIT DETAIL — HOC + OFFICER ──────────────────────────────────
-// V3: includes full aiAssessment and cashSettlement
+// ─── GET SINGLE WRIT DETAIL — HOC + EXECUTIVE + OFFICER ──────────────────────
 exports.getWritDetail = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
         const { writNumber } = req.params;
 
         const parts = writNumber.split('-');
-        const normalized = parts.length === 4
-            ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}`
-            : writNumber;
+        const normalized = parts.length === 4 ? `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}` : writNumber;
 
         const log = await prisma.accidentLog.findUnique({
             where: { writNumber: normalized },
             include: {
                 driver: {
-                    select: {
-                        insurerId: true,
-                        vehiclePlate: true,
-                        vehicleMakeModel: true,
-                        vehicleType: true,
-                        policyNumber: true,
-                        policyExpiry: true,
-                        phone: true,
-                        email: true
-                    }
+                    select: { insurerId: true, vehiclePlate: true, vehicleMakeModel: true, vehicleType: true, policyNumber: true, policyExpiry: true, phone: true, email: true }
                 },
                 writRebate: true,
                 aiAssessment: true,
@@ -256,26 +230,19 @@ exports.getWritDetail = async (req, res) => {
     }
 };
 
-// ─── GET MY INVOICES — HOC + ACCOUNTS ────────────────────────────────────────
+// ─── GET MY INVOICES — HOC + EXECUTIVE + OFFICER ─────────────────────────────
 exports.getMyInvoices = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
-
-        const invoices = await prisma.invoice.findMany({
-            where: { insurerId },
-            orderBy: { createdAt: 'desc' }
-        });
-
+        const invoices = await prisma.invoice.findMany({ where: { insurerId }, orderBy: { createdAt: 'desc' } });
         return res.status(200).json({ count: invoices.length, invoices });
-
     } catch (error) {
         console.error('AWAS V3 getMyInvoices Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
 
-// ─── CSV UPLOAD — HOC + OFFICER + BACKROOM ───────────────────────────────────
-// V3: onboarding fee now read from PricingConfig by vehicleType per row
+// ─── CSV UPLOAD — HOC + EXECUTIVE + OFFICER + CLERICAL ───────────────────────
 exports.uploadCsv = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -308,8 +275,6 @@ exports.uploadCsv = async (req, res) => {
         let successRows = 0;
         let failedRows = 0;
         const errors = [];
-
-        // Track new drivers per vehicleType for invoicing
         const newDriversByType = { CAR: 0, MOTORCYCLE: 0, LORRY: 0, BUS: 0, VAN: 0 };
 
         for (const row of rows) {
@@ -353,7 +318,7 @@ exports.uploadCsv = async (req, res) => {
                         insurerId,
                         vehiclePlate: plate,
                         vehicleMakeModel: row['vehiclemakemodel'] || 'Unknown',
-                        vehicleType: vehicleType,
+                        vehicleType,
                         mykadLastFour: row['mykadlastfour'] || '0000',
                         phone: row['phone'] || '',
                         email,
@@ -365,7 +330,6 @@ exports.uploadCsv = async (req, res) => {
                     }
                 });
 
-                // Track new driver by type
                 if (newDriversByType.hasOwnProperty(vehicleType)) {
                     newDriversByType[vehicleType]++;
                 } else {
@@ -407,16 +371,9 @@ exports.uploadCsv = async (req, res) => {
         }
 
         await prisma.csvUpload.create({
-            data: {
-                insurerId,
-                fileName: req.file.originalname || 'upload.csv',
-                totalRows: rows.length,
-                successRows,
-                failedRows
-            }
+            data: { insurerId, fileName: req.file.originalname || 'upload.csv', totalRows: rows.length, successRows, failedRows }
         });
 
-        // ─── Generate ONBOARDING invoices per vehicleType from PricingConfig ──
         for (const [vehicleType, count] of Object.entries(newDriversByType)) {
             if (count === 0) continue;
             try {
@@ -427,14 +384,9 @@ exports.uploadCsv = async (req, res) => {
 
                 await prisma.invoice.create({
                     data: {
-                        invoiceNumber,
-                        insurerId,
-                        invoiceType: 'ONBOARDING',
-                        periodStart: now,
-                        periodEnd: now,
-                        totalUnits: count,
-                        unitFee,
-                        totalAmount
+                        invoiceNumber, insurerId, invoiceType: 'ONBOARDING',
+                        periodStart: now, periodEnd: now,
+                        totalUnits: count, unitFee, totalAmount
                     }
                 });
 
@@ -448,9 +400,7 @@ exports.uploadCsv = async (req, res) => {
 
         return res.status(200).json({
             message: `CSV diproses. ${successRows} berjaya, ${failedRows} gagal.`,
-            successRows,
-            failedRows,
-            newDriversCount: totalNewDrivers,
+            successRows, failedRows, newDriversCount: totalNewDrivers,
             errors: errors.length > 0 ? errors : undefined
         });
 
@@ -460,15 +410,11 @@ exports.uploadCsv = async (req, res) => {
     }
 };
 
-// ─── GET CSV UPLOAD HISTORY — HOC + OFFICER + BACKROOM ───────────────────────
+// ─── GET CSV UPLOAD HISTORY — HOC + EXECUTIVE + OFFICER + CLERICAL ───────────
 exports.getCsvUploads = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
-        const uploads = await prisma.csvUpload.findMany({
-            where: { insurerId },
-            orderBy: { uploadedAt: 'desc' },
-            take: 50
-        });
+        const uploads = await prisma.csvUpload.findMany({ where: { insurerId }, orderBy: { uploadedAt: 'desc' }, take: 50 });
         return res.status(200).json({ count: uploads.length, uploads });
     } catch (error) {
         console.error('AWAS V3 getCsvUploads Fault:', error);
@@ -477,6 +423,7 @@ exports.getCsvUploads = async (req, res) => {
 };
 
 // ─── CREATE INSURER USER — HOC ONLY ──────────────────────────────────────────
+// UPDATED: valid roles now EXECUTIVE/OFFICER/CLERICAL (was OFFICER/BACKROOM/ACCOUNTS)
 exports.createInsurerUser = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -490,37 +437,22 @@ exports.createInsurerUser = async (req, res) => {
             return res.status(403).json({ error: 'Anda tidak boleh mencipta akaun HOC.' });
         }
 
-        const validRoles = ['OFFICER', 'BACKROOM', 'ACCOUNTS'];
+        const validRoles = ['EXECUTIVE', 'OFFICER', 'CLERICAL'];
         if (!validRoles.includes(role)) {
             return res.status(400).json({ error: 'Peranan tidak sah.' });
         }
 
-        const existing = await prisma.insurerUser.findUnique({
-            where: { email: email.toLowerCase() }
-        });
-        if (existing) {
-            return res.status(409).json({ error: 'Emel sudah digunakan.' });
-        }
+        const existing = await prisma.insurerUser.findUnique({ where: { email: email.toLowerCase() } });
+        if (existing) return res.status(409).json({ error: 'Emel sudah digunakan.' });
 
         const tempPassword = generateTempPassword();
         const passwordHash = await bcrypt.hash(tempPassword, 12);
 
         const insurerUser = await prisma.insurerUser.create({
-            data: {
-                insurerId,
-                name,
-                email: email.toLowerCase(),
-                passwordHash,
-                role,
-                mustChangePassword: true,
-                status: 'ACTIVE'
-            }
+            data: { insurerId, name, email: email.toLowerCase(), passwordHash, role, mustChangePassword: true, status: 'ACTIVE' }
         });
 
-        const insurer = await prisma.insurer.findUnique({
-            where: { id: insurerId },
-            select: { name: true }
-        });
+        const insurer = await prisma.insurer.findUnique({ where: { id: insurerId }, select: { name: true } });
 
         try {
             await resend.emails.send({
@@ -549,11 +481,7 @@ exports.createInsurerUser = async (req, res) => {
             console.error('AWAS V3: InsurerUser welcome email fault:', emailErr);
         }
 
-        return res.status(201).json({
-            message: `Pengguna ${name} (${role}) berjaya dicipta.`,
-            userId: insurerUser.id,
-            role: insurerUser.role
-        });
+        return res.status(201).json({ message: `Pengguna ${name} (${role}) berjaya dicipta.`, userId: insurerUser.id, role: insurerUser.role });
 
     } catch (error) {
         console.error('AWAS V3 createInsurerUser Fault:', error);
@@ -565,23 +493,12 @@ exports.createInsurerUser = async (req, res) => {
 exports.getInsurerUsers = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
-
         const users = await prisma.insurerUser.findMany({
             where: { insurerId },
             orderBy: { createdAt: 'desc' },
-            select: {
-                id: true,
-                name: true,
-                email: true,
-                role: true,
-                status: true,
-                mustChangePassword: true,
-                createdAt: true
-            }
+            select: { id: true, name: true, email: true, role: true, status: true, mustChangePassword: true, createdAt: true }
         });
-
         return res.status(200).json({ count: users.length, users });
-
     } catch (error) {
         console.error('AWAS V3 getInsurerUsers Fault:', error);
         return res.status(500).json({ error: 'Ralat pelayan.' });
@@ -601,10 +518,7 @@ exports.toggleInsurerUserStatus = async (req, res) => {
         if (user.role === 'HOC') return res.status(403).json({ error: 'Status HOC tidak boleh diubah.' });
 
         const newStatus = user.status === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE';
-        await prisma.insurerUser.update({
-            where: { id: parseInt(id) },
-            data: { status: newStatus }
-        });
+        await prisma.insurerUser.update({ where: { id: parseInt(id) }, data: { status: newStatus } });
 
         return res.status(200).json({ message: `${user.name} status dikemas kini kepada ${newStatus}.` });
 
@@ -615,8 +529,6 @@ exports.toggleInsurerUserStatus = async (req, res) => {
 };
 
 // ─── V3: GET SETTLEMENTS — HOC ONLY ──────────────────────────────────────────
-// Lists all CashSettlement records for this insurer.
-// Filterable by status.
 exports.getSettlements = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -631,29 +543,11 @@ exports.getSettlements = async (req, res) => {
             include: {
                 accidentLog: {
                     select: {
-                        writNumber: true,
-                        claimType: true,
-                        submittedAt: true,
-                        policeReportNumber: true,
-                        policeReportUploadedAt: true,
-                        driver: {
-                            select: {
-                                vehiclePlate: true,
-                                vehicleMakeModel: true,
-                                vehicleType: true,
-                                policyNumber: true,
-                                phone: true,
-                                email: true
-                            }
-                        },
+                        writNumber: true, claimType: true, submittedAt: true,
+                        policeReportNumber: true, policeReportUploadedAt: true,
+                        driver: { select: { vehiclePlate: true, vehicleMakeModel: true, vehicleType: true, policyNumber: true, phone: true, email: true } },
                         aiAssessment: {
-                            select: {
-                                status: true,
-                                totalEstimatedCost: true,
-                                overallSeverity: true,
-                                confidenceLevel: true,
-                                sentToInsurerAt: true
-                            }
+                            select: { status: true, totalEstimatedCost: true, overallSeverity: true, confidenceLevel: true, fraudFlagged: true, sentToInsurerAt: true }
                         }
                     }
                 }
@@ -669,7 +563,6 @@ exports.getSettlements = async (req, res) => {
 };
 
 // ─── V3: GET SETTLEMENT DETAIL — HOC ONLY ────────────────────────────────────
-// Full detail including AI assessment JSON and all docs.
 exports.getSettlementDetail = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -680,17 +573,7 @@ exports.getSettlementDetail = async (req, res) => {
             include: {
                 accidentLog: {
                     include: {
-                        driver: {
-                            select: {
-                                vehiclePlate: true,
-                                vehicleMakeModel: true,
-                                vehicleType: true,
-                                policyNumber: true,
-                                policyExpiry: true,
-                                phone: true,
-                                email: true
-                            }
-                        },
+                        driver: { select: { vehiclePlate: true, vehicleMakeModel: true, vehicleType: true, policyNumber: true, policyExpiry: true, phone: true, email: true } },
                         aiAssessment: true,
                         writRebate: true
                     }
@@ -701,7 +584,16 @@ exports.getSettlementDetail = async (req, res) => {
         if (!settlement) return res.status(404).json({ error: 'Settlement tidak dijumpai.' });
         if (settlement.insurerId !== insurerId) return res.status(403).json({ error: 'Akses ditolak.' });
 
-        return res.status(200).json({ settlement });
+        // Attach the applicable fee tier for HOC's reference before they offer
+        let applicableTier = null;
+        if (settlement.accidentLog.aiAssessment?.totalEstimatedCost) {
+            applicableTier = await findSettlementTier(
+                settlement.accidentLog.driver.vehicleType,
+                parseFloat(settlement.accidentLog.aiAssessment.totalEstimatedCost)
+            );
+        }
+
+        return res.status(200).json({ settlement, applicableTier });
 
     } catch (error) {
         console.error('AWAS V3 getSettlementDetail Fault:', error);
@@ -710,9 +602,13 @@ exports.getSettlementDetail = async (req, res) => {
 };
 
 // ─── V3: MAKE SETTLEMENT OFFER — HOC ONLY ────────────────────────────────────
-// HOC reviews AI assessment and makes cash offer to policyholder.
-// Creates OFFERED record. Notifies policyholder via email.
-// Offer expires in 7 days.
+// CHANGED: now enforces the claim-value ceiling agreed today. Before
+// allowing an offer, checks SettlementFeeTier for the vehicle's claim
+// amount band. If that band is not eligible for cash settlement (total
+// loss / high-value territory), the offer is blocked outright — HOC must
+// route it to manual adjuster / Merimen instead. This also protects
+// against lienholder-consent and salvage-value gaps that cash settlement
+// was never designed to handle.
 exports.makeSettlementOffer = async (req, res) => {
     try {
         const { insurerId } = req.insurerUser;
@@ -728,19 +624,8 @@ exports.makeSettlementOffer = async (req, res) => {
             include: {
                 accidentLog: {
                     include: {
-                        driver: {
-                            select: {
-                                vehiclePlate: true,
-                                vehicleMakeModel: true,
-                                vehicleType: true,
-                                email: true,
-                                phone: true,
-                                policyNumber: true
-                            }
-                        },
-                        aiAssessment: {
-                            select: { totalEstimatedCost: true, overallSeverity: true }
-                        }
+                        driver: { select: { id: true, vehiclePlate: true, vehicleMakeModel: true, vehicleType: true, email: true, phone: true, policyNumber: true } },
+                        aiAssessment: { select: { totalEstimatedCost: true, overallSeverity: true, fraudFlagged: true } }
                     }
                 }
             }
@@ -752,23 +637,51 @@ exports.makeSettlementOffer = async (req, res) => {
             return res.status(409).json({ error: `Settlement sudah dalam status ${settlement.status}. Tawaran tidak boleh dibuat.` });
         }
 
+        const aiAssessment = settlement.accidentLog.aiAssessment;
+        if (!aiAssessment || !aiAssessment.totalEstimatedCost) {
+            return res.status(400).json({ error: 'AI assessment belum lengkap. Tawaran tidak boleh dibuat sehingga assessment selesai.' });
+        }
+
+        // ─── CLAIM-VALUE CEILING CHECK ─────────────────────────────────────────
+        const vehicleType = settlement.accidentLog.driver.vehicleType;
+        const estimatedCost = parseFloat(aiAssessment.totalEstimatedCost);
+        const tier = await findSettlementTier(vehicleType, estimatedCost);
+
+        if (!tier || !tier.isEligibleForCashSettlement) {
+            return res.status(403).json({
+                error: `Tuntutan ini (RM${estimatedCost.toFixed(2)}) melebihi had penyelesaian tunai AWAS untuk ${vehicleType}. Sila teruskan melalui saluran adjuster/Merimen biasa.`,
+                estimatedCost,
+                vehicleType,
+                ceilingBlocked: true
+            });
+        }
+
         const now = new Date();
-        const offerExpiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7 days
+        const offerExpiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
         await prisma.cashSettlement.update({
             where: { id: parseInt(id) },
-            data: {
-                status: 'OFFERED',
-                offeredAmount: parseFloat(offeredAmount),
-                offeredAt: now,
-                offerExpiresAt
-            }
+            data: { status: 'OFFERED', offeredAmount: parseFloat(offeredAmount), offeredAt: now, offerExpiresAt }
         });
 
         const driver = settlement.accidentLog.driver;
         const writ = settlement.accidentLog;
 
-        // Notify policyholder via email
+        // ─── NEW: in-app notification — primary channel, email stays as backup ───
+        try {
+            await prisma.driverNotification.create({
+                data: {
+                    driverId: driver.id,
+                    accidentLogId: settlement.accidentLogId,
+                    type: 'SETTLEMENT_OFFERED',
+                    title: 'Tawaran Penyelesaian Tunai Diterima',
+                    message: `Syarikat insurans anda menawarkan RM${parseFloat(offeredAmount).toFixed(2)} untuk tuntutan ${writ.writNumber}. Tawaran sah sehingga ${offerExpiresAt.toLocaleDateString('ms-MY')}.`
+                }
+            });
+        } catch (notifErr) {
+            console.error('AWAS V3: Failed to create driver notification:', notifErr.message);
+        }
+
         try {
             await resend.emails.send({
                 from: 'AWAS <hello@awas.asia>',
@@ -781,12 +694,12 @@ exports.makeSettlementOffer = async (req, res) => {
                     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Nombor Writ</td><td style="padding:8px;font-weight:800;">${writ.writNumber}</td></tr>
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Kenderaan</td><td style="padding:8px;">${driver.vehicleMakeModel} (${driver.vehiclePlate})</td></tr>
-                        <tr><td style="padding:8px;font-weight:700;color:#47456;font-size:1.1rem;">Jumlah Tawaran</td><td style="padding:8px;font-weight:900;color:#16a34a;font-size:1.3rem;">RM ${parseFloat(offeredAmount).toFixed(2)}</td></tr>
+                        <tr><td style="padding:8px;font-weight:700;color:#475569;font-size:1.1rem;">Jumlah Tawaran</td><td style="padding:8px;font-weight:900;color:#16a34a;font-size:1.3rem;">RM ${parseFloat(offeredAmount).toFixed(2)}</td></tr>
                         <tr><td style="padding:8px;font-weight:700;color:#475569;">Tawaran Tamat</td><td style="padding:8px;color:#dc2626;">${offerExpiresAt.toLocaleDateString('ms-MY')}</td></tr>
                     </table>
                     <p>Jika anda <strong>terima</strong>, wang akan dibayar terus ke akaun bank anda. Anda boleh membuat pembaikan di mana-mana bengkel pilihan anda sebagai pelanggan tunai.</p>
                     <p>Jika anda <strong>tolak</strong>, tuntutan akan diteruskan melalui saluran insurans biasa (Merimen).</p>
-                    <div style="margin:24px 0;display:flex;gap:12px;">
+                    <div style="margin:24px 0;">
                         <a href="${process.env.FE_URL}/settlement/${id}" style="background:#16a34a;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block;">Lihat Tawaran</a>
                     </div>
                     <p style="font-size:0.75rem;color:#94a3b8;">Tawaran ini sah sehingga ${offerExpiresAt.toLocaleDateString('ms-MY')} sahaja.</p>
@@ -797,7 +710,7 @@ exports.makeSettlementOffer = async (req, res) => {
             console.error('AWAS V3: Settlement offer email fault:', emailErr);
         }
 
-        console.log(`AWAS V3: Settlement offer made — ID ${id} — RM${offeredAmount} — expires ${offerExpiresAt.toISOString()}`);
+        console.log(`AWAS V3: Settlement offer made — ID ${id} — RM${offeredAmount} — tier fee RM${tier.fee} — expires ${offerExpiresAt.toISOString()}`);
 
         return res.status(200).json({
             message: `Tawaran RM${parseFloat(offeredAmount).toFixed(2)} berjaya dihantar kepada ${driver.vehiclePlate}.`,
@@ -805,7 +718,8 @@ exports.makeSettlementOffer = async (req, res) => {
             offeredAmount: parseFloat(offeredAmount),
             offeredAt: now,
             offerExpiresAt,
-            status: 'OFFERED'
+            status: 'OFFERED',
+            applicableTierFee: tier.fee
         });
 
     } catch (error) {
@@ -813,3 +727,5 @@ exports.makeSettlementOffer = async (req, res) => {
         return res.status(500).json({ error: 'Ralat pelayan.' });
     }
 };
+
+module.exports = exports;

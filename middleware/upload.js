@@ -2,13 +2,19 @@ const multer = require('multer');
 
 const storage = multer.memoryStorage();
 
+// FIXED: application/pdf was missing entirely. Police reports and settlement
+// docs (VOC, discharge voucher) are frequently issued/scanned as PDF in
+// Malaysia — without this, uploadPoliceReport would silently reject the file
+// before it ever reached the controller, breaking the whole writ → AI
+// assessment flow for anyone whose police report happened to be a PDF.
 const fileFilter = (req, file, cb) => {
     const allowedVideo = ['video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp'];
     const allowedImage = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
     const allowedAudio = ['audio/webm', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav'];
+    const allowedDocument = ['application/pdf'];
     const allowedCsv = ['text/csv', 'application/vnd.ms-excel', 'text/plain'];
 
-    if ([...allowedVideo, ...allowedImage, ...allowedAudio, ...allowedCsv].includes(file.mimetype)) {
+    if ([...allowedVideo, ...allowedImage, ...allowedAudio, ...allowedDocument, ...allowedCsv].includes(file.mimetype)) {
         cb(null, true);
     } else {
         cb(new Error('Jenis fail tidak dibenarkan.'), false);
@@ -38,13 +44,13 @@ exports.uploadEvidence = upload.fields([
 // CSV upload
 exports.uploadCsv = upload.single('csv');
 
-// V3: Police report upload (single image/PDF)
+// V3: Police report upload (image OR PDF)
 exports.uploadPoliceReport = upload.fields([
     { name: 'policeReport', maxCount: 1 }
 ]);
 
 // V3: Settlement docs upload
-// IC + driving licence + VOC + discharge voucher
+// IC + driving licence + VOC + discharge voucher — image OR PDF
 exports.uploadSettlementDocs = upload.fields([
     { name: 'ic', maxCount: 1 },
     { name: 'licence', maxCount: 1 },
