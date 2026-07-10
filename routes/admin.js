@@ -30,12 +30,18 @@ router.post('/csv-upload', uploadCsv, adminController.uploadCsv);
 router.get('/csv-uploads', adminController.getCsvUploads);
 
 // Invoices
-router.post('/invoices/generate-writ', adminController.generateWritInvoice);
 router.get('/invoices', adminController.getInvoices);
 router.patch('/invoices/:id/mark-paid', adminController.markInvoicePaid);
 
 // V3: Pricing config
 router.get('/pricing', adminController.getPricing);
 router.put('/pricing', adminController.updatePricing);
+
+// V3: Settlement fee tiers
+router.get('/settlement-fee-tiers', adminController.getSettlementFeeTiers);
+router.put('/settlement-fee-tiers', adminController.updateSettlementFeeTiers);
+
+// V3: Cash rebate toggle
+router.patch('/insurers/:id/toggle-rebate', adminController.toggleCashRebate);
 
 module.exports = router;
